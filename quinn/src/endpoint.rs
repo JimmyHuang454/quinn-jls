@@ -1,10 +1,10 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fmt,
     future::Future,
     io::{self, IoSliceMut},
     mem,
-    net::{SocketAddr, SocketAddrV6, ToSocketAddrs},
+    net::{SocketAddr, SocketAddrV6},
     pin::Pin,
     str,
     sync::{
@@ -28,7 +28,7 @@ use crate::{
 use bytes::{Bytes, BytesMut};
 use pin_project_lite::pin_project;
 use proto::{
-    self as proto, ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EcnCodepoint, EndpointEvent, ServerConfig, Transmit
+    self as proto, ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointEvent, ServerConfig, Transmit
 };
 use rustc_hash::FxHashMap;
 #[cfg(all(
@@ -37,7 +37,7 @@ use rustc_hash::FxHashMap;
     any(feature = "aws-lc-rs", feature = "ring"),
 ))]
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::{runtime, sync::{futures::Notified, mpsc, watch::error, Notify}};
+use tokio::sync::{futures::Notified, mpsc, Notify};
 use tracing::{Instrument, Span};
 use udp::{BATCH_SIZE, RecvMeta, is_msg_size_err};
 
@@ -46,7 +46,7 @@ use crate::{
     connection::Connecting, incoming::Incoming, work_limiter::WorkLimiter,
 };
 
-use tracing::{debug, trace};
+use tracing::trace;
 /// A QUIC endpoint.
 ///
 /// An endpoint corresponds to a single UDP socket, may host many connections, and may act as both
@@ -470,7 +470,7 @@ impl EndpointInner {
                     accepting
                 }
                 Err(error) => {
-                    for (transmit) in error.response {
+                    for transmit in error.response {
                         respond(transmit, &response_buffer, &mut state.sender);
                     }
                     return Err(error.cause);
@@ -642,13 +642,13 @@ impl State {
         true
     }
 
-    fn upstream_recv<'a>(&'a mut self, cx: &mut Context, now: Instant) -> Result<bool, io::Error> {
+    fn upstream_recv<'a>(&'a mut self, cx: &mut Context<'_>, now: Instant) -> Result<bool, io::Error> {
         let mut last_err: Option<io::Error> = None;
         let mut to_remove = Vec::<SocketAddr>::new();
         let upstream_conns = &mut self.recv_state.jls_state.upstream_connections;
         for (remote, conn) in upstream_conns.iter_mut() {
             let mut metas = [RecvMeta::default(); BATCH_SIZE];
-            let mut iovs: [IoSliceMut; BATCH_SIZE] = {
+            let mut iovs: [IoSliceMut<'_>; BATCH_SIZE] = {
                 let mut bufs = conn
                     .from_upstream
                     .chunks_mut(conn.from_upstream.len() / BATCH_SIZE)
@@ -728,7 +728,7 @@ impl Drop for State {
 }
 
 pub(crate) fn respond(
-    transmit: proto::Transmit,
+    transmit: Transmit,
     response_buffer: &[u8],
     sender: &mut Pin<Box<dyn UdpSender>>,
 ) {

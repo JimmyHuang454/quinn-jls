@@ -5077,3 +5077,64 @@ fn qlog_packet_lost_trigger() {
         ]
     );
 }
+
+/// Every Copa variant carries a bulk transfer through a real connection: handshake, batched ACK
+/// processing, the controller-chosen pacing rate and flow control all work together
+#[test]
+fn copa_bulk_transfer() {
+    use crate::congestion::CopaConfig;
+
+    let _guard = subscribe();
+    const LEN: usize = 512 * 1024;
+    let data = vec![42u8; LEN];
+    for (name, config) in [
+        ("copa", CopaConfig::default()),
+        ("copa-nc", CopaConfig::copa_nc()),
+        ("copa-auto", CopaConfig::copa_auto()),
+        ("copa-auto-nc", CopaConfig::copa_auto_nc()),
+    ] {
+        let mut transport = TransportConfig::default();
+        transport.congestion_controller_factory(Arc::new(config));
+        let mut client_config = client_config();
+        client_config.transport_config(Arc::new(transport));
+
+        let mut pair = Pair::default();
+        pair.latency = Duration::from_millis(10);
+        let (client_ch, server_ch) = pair.connect_with(client_config);
+        let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+
+        let (mut written, mut received, mut finished) = (0, 0, false);
+        let mut accepted = false;
+        for _ in 0..10_000 {
+            if written < LEN {
+                match pair.client_send(client_ch, s).write(&data[written..]) {
+                    Ok(n) => written += n,
+                    Err(WriteError::Blocked) => {}
+                    Err(e) => panic!("{name}: {e:?}"),
+                }
+            } else if !finished {
+                pair.client_send(client_ch, s).finish().unwrap();
+                finished = true;
+            }
+            pair.drive();
+            if !accepted {
+                accepted = pair.server_streams(server_ch).accept(Dir::Uni) == Some(s);
+            }
+            if accepted {
+                let mut recv = pair.server_recv(server_ch, s);
+                let mut chunks = recv.read(false).unwrap();
+                while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                    received += chunk.bytes.len();
+                }
+                let _ = chunks.finalize();
+            }
+            if received == LEN {
+                break;
+            }
+        }
+        assert_eq!(received, LEN, "{name}");
+        let stats = pair.client_conn_mut(client_ch).stats();
+        assert!(stats.path.cwnd >= 4 * 1200, "{name}: {:?}", stats.path);
+        assert_eq!(stats.path.lost_packets, 0, "{name}");
+    }
+}

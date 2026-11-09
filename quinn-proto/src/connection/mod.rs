@@ -650,11 +650,15 @@ impl Connection {
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
+                    let pacing_window = match self.path.congestion.pacing_rate() {
+                        Some(rate) => pacing::window_for_rate(rate, smoothed_rtt),
+                        None => self.path.congestion.window(),
+                    };
                     if let Some(delay) = self.path.pacing.delay(
                         smoothed_rtt,
                         bytes_to_send,
                         self.path.current_mtu(),
-                        self.path.congestion.window(),
+                        pacing_window,
                         now,
                     ) {
                         self.timers.set(Timer::Pacing, delay);
@@ -4153,9 +4157,12 @@ pub enum ConnectionError {
     JlsForwardError(String),
 }
 
+/// Details of a failed JLS authentication
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct JlsAuthInner {
+    /// Upstream server the connection is forwarded to, if any
     pub upstream_addr: Option<String>,
+    /// Address of the peer that failed authentication
     pub remote_addr: SocketAddr,
 }
 

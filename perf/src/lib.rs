@@ -202,6 +202,14 @@ pub enum CongestionAlgorithm {
     Cubic,
     Bbr,
     NewReno,
+    /// Copa, delta 0.5, competitive mode on
+    Copa,
+    /// Copa with the competitive mode off
+    CopaNc,
+    /// Copa with delta chosen online, competitive mode on
+    CopaAuto,
+    /// Copa with delta chosen online, competitive mode off
+    CopaAutoNc,
 }
 
 impl CongestionAlgorithm {
@@ -210,6 +218,10 @@ impl CongestionAlgorithm {
             Self::Cubic => Arc::new(congestion::CubicConfig::default()),
             Self::Bbr => Arc::new(congestion::BbrConfig::default()),
             Self::NewReno => Arc::new(congestion::NewRenoConfig::default()),
+            Self::Copa => Arc::new(congestion::CopaConfig::default()),
+            Self::CopaNc => Arc::new(congestion::CopaConfig::copa_nc()),
+            Self::CopaAuto => Arc::new(congestion::CopaConfig::copa_auto()),
+            Self::CopaAutoNc => Arc::new(congestion::CopaConfig::copa_auto_nc()),
         }
     }
 }

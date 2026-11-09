@@ -165,6 +165,16 @@ fn optimal_capacity(smoothed_rtt: Duration, window: u64, mtu: u16) -> u64 {
 /// Clamps the window to limit the sending rate to `max_bytes_per_second`.
 ///
 /// If `max_bytes_per_second` is `None`, the original window is returned.
+/// The window that makes the pacer send at `bytes_per_second`
+///
+/// Used when the congestion controller chooses its own pacing rate. The pacer refills tokens at
+/// `1.25 * window / smoothed_rtt`, so the 1.25 is cancelled here.
+pub(super) fn window_for_rate(bytes_per_second: u64, smoothed_rtt: Duration) -> u64 {
+    let window = bytes_per_second as f64 * smoothed_rtt.as_secs_f64() / 1.25;
+    // `as` saturates, and the pacer rejects a zero window
+    (window.round() as u64).max(1)
+}
+
 fn rate_limited_window(
     smoothed_rtt: Duration,
     window: u64,
@@ -201,6 +211,42 @@ const MAX_BURST_SIZE: u64 = 256;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_rate_is_respected() {
+        // A controller asks for 1 MB/s while the smoothed RTT is 50 ms. Sending as fast as the
+        // pacer allows for one second must deliver close to 1 MB (plus the initial burst).
+        let rate = 1_000_000;
+        let rtt = Duration::from_millis(50);
+        let mtu = 1200u16;
+        let start = Instant::now();
+        let window = window_for_rate(rate, rtt);
+        let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+        let mut now = start;
+        let mut sent = 0u64;
+        while now < start + Duration::from_secs(1) {
+            match pacer.delay(rtt, mtu.into(), mtu, window, now) {
+                None => {
+                    pacer.on_transmit(mtu);
+                    sent += u64::from(mtu);
+                }
+                Some(t) => now = t.max(now + Duration::from_micros(1)),
+            }
+        }
+        let burst = optimal_capacity(rtt, window, mtu);
+        assert!(sent >= rate * 9 / 10, "sent {sent}");
+        assert!(sent <= rate + burst + u64::from(mtu), "sent {sent}");
+    }
+
+    #[test]
+    fn window_for_rate_never_zero() {
+        assert_eq!(window_for_rate(0, Duration::from_millis(10)), 1);
+        assert_eq!(window_for_rate(1000, Duration::ZERO), 1);
+        assert_eq!(
+            window_for_rate(u64::MAX, Duration::from_secs(1000)),
+            u64::MAX
+        );
+    }
 
     #[test]
     fn does_not_panic_on_bad_instant() {

@@ -6,10 +6,12 @@ use std::any::Any;
 use std::sync::Arc;
 
 mod bbr;
+mod copa;
 mod cubic;
 mod new_reno;
 
 pub use bbr::{Bbr, BbrConfig};
+pub use copa::{Copa, CopaAutoConfig, CopaAutoEstimate, CopaConfig, CopaVelocity};
 pub use cubic::{Cubic, CubicConfig};
 pub use new_reno::{NewReno, NewRenoConfig};
 
@@ -71,6 +73,15 @@ pub trait Controller: Send + Sync {
 
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
+
+    /// Sending rate in bytes per second that the controller wants packets to be paced at
+    ///
+    /// `None` (the default) paces at `1.25 * window / smoothed_rtt`. Controllers whose control
+    /// law specifies its own pacing rate (e.g. Copa paces at `2 * cwnd / RTT_standing`) return
+    /// it here. The connection still applies `TransportConfig`'s send rate limit, if any.
+    fn pacing_rate(&self) -> Option<u64> {
+        None
+    }
 
     /// Retrieve implementation-specific metrics used to populate connection statistics and `qlog`
     /// traces when they are enabled

@@ -6,8 +6,8 @@ use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg32;
 
 use crate::congestion::ControllerMetrics;
-use crate::congestion::bbr::bw_estimation::BandwidthEstimation;
-use crate::congestion::bbr::min_max::MinMax;
+use crate::congestion::bbr1::bw_estimation::BandwidthEstimation;
+use crate::congestion::bbr1::min_max::MinMax;
 use crate::connection::RttEstimator;
 use crate::packet::SpaceId;
 use crate::{Duration, Instant};
@@ -17,15 +17,17 @@ use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
 mod bw_estimation;
 mod min_max;
 
-/// Experimental! Use at your own risk.
+/// BBRv1. Experimental! Use at your own risk.
+///
+/// Also available as [`Bbr`](super::Bbr), the default BBR version.
 ///
 /// Aims for reduced buffer bloat and improved performance over high bandwidth-delay product networks.
 /// Based on google's quiche implementation <https://source.chromium.org/chromium/chromium/src/+/master:net/third_party/quiche/src/quic/core/congestion_control/bbr_sender.cc>
 /// of BBR <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control>.
 /// More discussion and links at <https://groups.google.com/g/bbr-dev>.
 #[derive(Debug, Clone)]
-pub struct Bbr {
-    config: Arc<BbrConfig>,
+pub struct Bbr1 {
+    config: Arc<Bbr1Config>,
     current_mtu: u64,
     max_bandwidth: BandwidthEstimation,
     acked_bytes: u64,
@@ -61,9 +63,9 @@ pub struct Bbr {
     random_number_generator: Pcg32,
 }
 
-impl Bbr {
+impl Bbr1 {
     /// Construct a state using the given `config` and current time `now`
-    pub fn new(config: Arc<BbrConfig>, current_mtu: u16) -> Self {
+    pub fn new(config: Arc<Bbr1Config>, current_mtu: u16) -> Self {
         let initial_window = config.initial_window;
         Self {
             config,
@@ -392,7 +394,7 @@ impl Bbr {
     }
 }
 
-impl Controller for Bbr {
+impl Controller for Bbr1 {
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
         self.max_sent_packet_number = last_packet_number;
         self.max_bandwidth.on_sent(now, bytes);
@@ -526,13 +528,13 @@ impl Controller for Bbr {
     }
 }
 
-/// Configuration for the [`Bbr`] congestion controller
+/// Configuration for the [`Bbr1`] congestion controller
 #[derive(Debug, Clone)]
-pub struct BbrConfig {
+pub struct Bbr1Config {
     initial_window: u64,
 }
 
-impl BbrConfig {
+impl Bbr1Config {
     /// Default limit on the amount of outstanding data in bytes.
     ///
     /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
@@ -542,7 +544,7 @@ impl BbrConfig {
     }
 }
 
-impl Default for BbrConfig {
+impl Default for Bbr1Config {
     fn default() -> Self {
         Self {
             initial_window: K_MAX_INITIAL_CONGESTION_WINDOW * BASE_DATAGRAM_SIZE,
@@ -550,9 +552,9 @@ impl Default for BbrConfig {
     }
 }
 
-impl ControllerFactory for BbrConfig {
+impl ControllerFactory for Bbr1Config {
     fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(Bbr::new(self, current_mtu))
+        Box::new(Bbr1::new(self, current_mtu))
     }
 }
 
@@ -670,7 +672,7 @@ mod tests {
 
     #[test]
     fn metrics_report_bandwidth_estimate() {
-        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200);
+        let mut bbr = Bbr1::new(Arc::new(Bbr1Config::default()), 1200);
         assert_eq!(bbr.metrics().bandwidth_estimate, None);
 
         let start = Instant::now();

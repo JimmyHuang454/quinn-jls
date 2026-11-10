@@ -6,13 +6,19 @@ use crate::{Duration, Instant};
 use std::any::Any;
 use std::sync::Arc;
 
-mod bbr;
+mod bbr1;
+mod bbr2;
 mod bbr3;
 mod copa;
 mod cubic;
 mod new_reno;
 
-pub use bbr::{Bbr, BbrConfig};
+pub use bbr1::{Bbr1, Bbr1Config};
+/// The default BBR: BBRv1, the most mature of the three versions
+pub type Bbr = Bbr1;
+/// Configuration for [`Bbr`] (BBRv1)
+pub type BbrConfig = Bbr1Config;
+pub use bbr2::{Bbr2, Bbr2Config, BbrBwLoReductionStrategy, BbrParams};
 pub use bbr3::{Bbr3, Bbr3Config};
 pub use copa::{Copa, CopaAutoConfig, CopaAutoEstimate, CopaConfig, CopaVelocity};
 pub use cubic::{Cubic, CubicConfig};

@@ -200,8 +200,11 @@ pub fn parse_byte_size(s: &str) -> Result<u64, ParseIntError> {
 #[derive(Clone, Copy, ValueEnum)]
 pub enum CongestionAlgorithm {
     Cubic,
-    /// quinn's original BBR (pre-BBRv3 implementation)
-    Bbr,
+    /// BBRv1, the default BBR (also accepted as `bbr`)
+    #[value(alias = "bbr")]
+    Bbr1,
+    /// BBRv2 (ported from quiche)
+    Bbr2,
     /// BBRv3
     Bbr3,
     NewReno,
@@ -219,7 +222,8 @@ impl CongestionAlgorithm {
     pub fn build(self) -> Arc<dyn ControllerFactory + Send + Sync + 'static> {
         match self {
             Self::Cubic => Arc::new(congestion::CubicConfig::default()),
-            Self::Bbr => Arc::new(congestion::BbrConfig::default()),
+            Self::Bbr1 => Arc::new(congestion::Bbr1Config::default()),
+            Self::Bbr2 => Arc::new(congestion::Bbr2Config::default()),
             Self::Bbr3 => Arc::new(congestion::Bbr3Config::default()),
             Self::NewReno => Arc::new(congestion::NewRenoConfig::default()),
             Self::Copa => Arc::new(congestion::CopaConfig::default()),

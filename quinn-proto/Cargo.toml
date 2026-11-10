@@ -68,6 +68,7 @@ rustls-pki-types = { workspace = true, features = ["web"] } # only added as depe
 web-time = { workspace = true }
 
 [dev-dependencies]
+rstest = "0.26"
 assert_matches = { workspace = true }
 hex-literal = { workspace = true  }
 rcgen = { workspace = true }

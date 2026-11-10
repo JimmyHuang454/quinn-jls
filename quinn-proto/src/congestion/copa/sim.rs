@@ -19,6 +19,7 @@ use std::sync::Arc;
 use super::{Copa, CopaConfig};
 use crate::congestion::{Controller, ControllerFactory};
 use crate::connection::RttEstimator;
+use crate::packet::SpaceId;
 use crate::{Duration, Instant};
 
 pub(super) const MTU: u64 = 1200;
@@ -26,7 +27,7 @@ pub(super) const MTU: u64 = 1200;
 /// How senders pace
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Pacing {
-    /// Use `Controller::pacing_rate`, falling back to quinn's `1.25 * window / srtt` (what quinn
+    /// Use `ControllerMetrics::pacing_rate`, falling back to quinn's `1.25 * window / srtt` (what quinn
     /// does with the pacing hook)
     Controller,
     /// Always `1.25 * window / srtt` (quinn without the pacing hook)
@@ -414,7 +415,7 @@ impl Sim {
             }
             let default_rate = 1.25 * window as f64 / rtt.get().as_secs_f64();
             let rate = match pacing {
-                Pacing::Controller => cc.pacing_rate().map_or(default_rate, |r| r as f64),
+                Pacing::Controller => cc.metrics().pacing_rate.map_or(default_rate, |r| r as f64),
                 Pacing::Quinn => default_rate,
             };
             let pn = sender.next_pn;
@@ -551,7 +552,7 @@ impl Sim {
                 continue;
             };
             s.in_flight -= size;
-            cc.on_ack(now, sent, size, false, &rtt);
+            cc.on_ack(now, sent, size, pn, SpaceId::Data, false, &rtt);
             if measuring {
                 s.delivered += size;
                 let sec = now
@@ -567,7 +568,7 @@ impl Sim {
         let Some((largest, largest_sent)) = largest else {
             return;
         };
-        cc.on_end_acks(now, s.in_flight, false, Some(largest));
+        cc.on_end_acks(now, s.in_flight, false, Some(largest), SpaceId::Data);
         let mut rtt = rtt;
         rtt.update(ack_delay, now.saturating_duration_since(largest_sent));
         s.rtt = Some(rtt);
@@ -598,7 +599,7 @@ impl Sim {
             s.persistent += 1;
         }
         let cc = self.flows[i].source.cc().unwrap();
-        cc.on_congestion_event(now, sent, persistent, false, size);
+        cc.on_congestion_event(now, sent, persistent, false, size, pn, SpaceId::Data);
         self.try_send(i);
     }
 }

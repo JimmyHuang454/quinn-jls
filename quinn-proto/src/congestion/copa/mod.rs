@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory, ControllerMetrics};
 use crate::connection::RttEstimator;
+use crate::packet::SpaceId;
 use crate::{Duration, Instant};
 
 mod auto;
@@ -387,12 +388,30 @@ impl Copa {
     }
 }
 
+impl Copa {
+    /// Sending rate in bytes per second Copa wants packets paced at
+    ///
+    /// Reported to the connection as [`ControllerMetrics::pacing_rate`], which drives the pacer.
+    pub(super) fn pacing_rate(&self) -> Option<u64> {
+        // Twice cwnd / RTT_standing, to accommodate pacing imperfections (section 2.1)
+        let standing = self.standing?.as_secs_f64();
+        if standing <= 0.0 {
+            return None;
+        }
+        let rate = 2.0 * self.window / standing;
+        let rate = self.pace_cap.map_or(rate, |(_, cap)| rate.min(cap));
+        Some(rate as u64)
+    }
+}
+
 impl Controller for Copa {
     fn on_ack(
         &mut self,
         now: Instant,
         sent: Instant,
         bytes: u64,
+        _pn: u64,
+        _space: SpaceId,
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
@@ -533,6 +552,8 @@ impl Controller for Copa {
         is_persistent_congestion: bool,
         _is_ecn: bool,
         _lost_bytes: u64,
+        _largest_lost: u64,
+        _space: SpaceId,
     ) {
         if let Some(saved) = &mut self.probe_saved {
             saved.congested = true;
@@ -576,23 +597,13 @@ impl Controller for Copa {
         self.window as u64
     }
 
-    fn pacing_rate(&self) -> Option<u64> {
-        // Twice cwnd / RTT_standing, to accommodate pacing imperfections (section 2.1)
-        let standing = self.standing?.as_secs_f64();
-        if standing <= 0.0 {
-            return None;
-        }
-        let rate = 2.0 * self.window / standing;
-        let rate = self.pace_cap.map_or(rate, |(_, cap)| rate.min(cap));
-        Some(rate as u64)
-    }
-
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
             congestion_window: self.window(),
             ssthresh: None,
-            pacing_rate: self.pacing_rate().map(|r| r.saturating_mul(8)),
+            pacing_rate: self.pacing_rate(),
             bandwidth_estimate: None,
+            send_quantum: None,
         }
     }
 

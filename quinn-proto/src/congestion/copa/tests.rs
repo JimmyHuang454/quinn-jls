@@ -1,6 +1,7 @@
 //! Unit tests that drive [`Copa`] through the [`Controller`] interface
 
 use super::*;
+use crate::packet::SpaceId;
 
 const MTU: u64 = 1200;
 
@@ -21,7 +22,7 @@ fn copa(config: CopaConfig) -> (Copa, Instant) {
 
 /// Acknowledge one MTU-sized packet whose RTT was `rtt_sample`
 fn ack(c: &mut Copa, now: Instant, rtt_sample: Duration, rtt: &RttEstimator) {
-    c.on_ack(now, now - rtt_sample, MTU, false, rtt);
+    c.on_ack(now, now - rtt_sample, MTU, 0, SpaceId::Data, false, rtt);
 }
 
 /// RTT_min = 50 ms from a first sample, then RTT_standing = 60 ms (dq = 10 ms), with a smoothed
@@ -146,8 +147,8 @@ fn default_mode_ignores_loss() {
     let rtt = rtt_estimator(ms(60));
     let t = ten_ms_queue(&mut c, t0, &rtt);
     let (w, delta) = (c.window(), c.delta());
-    c.on_congestion_event(t, t, false, false, 10 * MTU);
-    c.on_congestion_event(t + ms(500), t, false, true, 0);
+    c.on_congestion_event(t, t, false, false, 10 * MTU, 0, SpaceId::Data);
+    c.on_congestion_event(t + ms(500), t, false, true, 0, 0, SpaceId::Data);
     assert_eq!(c.window(), w);
     assert_eq!(c.delta(), delta);
     assert!(!c.is_competitive());
@@ -182,15 +183,15 @@ fn competitive_mode_halves_inverse_delta_once_per_rtt() {
     standing_queue(&mut c, &mut t, ms(300), &rtt);
     assert!(c.is_competitive());
     c.delta = 0.1;
-    c.on_congestion_event(t, t, false, false, MTU);
+    c.on_congestion_event(t, t, false, false, MTU, 0, SpaceId::Data);
     assert!((c.delta() - 0.2).abs() < 1e-12);
     // Same RTT: ignored
-    c.on_congestion_event(t + ms(10), t, false, false, MTU);
+    c.on_congestion_event(t + ms(10), t, false, false, MTU, 0, SpaceId::Data);
     assert!((c.delta() - 0.2).abs() < 1e-12);
     // Next RTT, and ECN counts as loss; never above the configured delta
-    c.on_congestion_event(t + ms(60), t, false, true, 0);
+    c.on_congestion_event(t + ms(60), t, false, true, 0, 0, SpaceId::Data);
     assert!((c.delta() - 0.4).abs() < 1e-12);
-    c.on_congestion_event(t + ms(120), t, false, false, MTU);
+    c.on_congestion_event(t + ms(120), t, false, false, MTU, 0, SpaceId::Data);
     assert!((c.delta() - 0.5).abs() < 1e-12);
 }
 
@@ -200,7 +201,7 @@ fn spurious_loss_restores_delta_in_competitive_mode() {
     let rtt = rtt_estimator(ms(50));
     standing_queue(&mut c, &mut t, ms(300), &rtt);
     c.delta = 0.1;
-    c.on_congestion_event(t, t, false, false, MTU);
+    c.on_congestion_event(t, t, false, false, MTU, 0, SpaceId::Data);
     c.on_spurious_congestion_event();
     assert!((c.delta() - 0.1).abs() < 1e-12);
 }
@@ -225,7 +226,7 @@ fn mode_switching_can_be_disabled() {
         standing_queue(&mut c, &mut t, ms(1000), &rtt);
         assert!(!c.is_competitive());
         let delta = c.delta();
-        c.on_congestion_event(t, t, false, false, MTU);
+        c.on_congestion_event(t, t, false, false, MTU, 0, SpaceId::Data);
         assert_eq!(c.delta(), delta);
     }
 }
@@ -238,7 +239,7 @@ fn persistent_congestion_restarts_slow_start() {
     c.slow_start = false;
     c.velocity = 8;
     c.window = (100 * MTU) as f64;
-    c.on_congestion_event(t, t, true, false, 100 * MTU);
+    c.on_congestion_event(t, t, true, false, 100 * MTU, 0, SpaceId::Data);
     assert_eq!(c.window(), MIN_WINDOW_PACKETS * MTU);
     assert!(c.in_slow_start());
     assert_eq!(c.velocity(), 1);
@@ -250,7 +251,7 @@ fn app_limited_does_not_grow_the_window() {
     let rtt = rtt_estimator(ms(50));
     let w = c.window();
     for i in 0..10 {
-        c.on_ack(t0 + ms(i), t0 + ms(i) - ms(50), MTU, true, &rtt);
+        c.on_ack(t0 + ms(i), t0 + ms(i) - ms(50), MTU, 0, SpaceId::Data, true, &rtt);
     }
     assert_eq!(c.window(), w);
     // The RTT filters are still updated
@@ -287,7 +288,7 @@ fn time_going_backwards_does_not_panic() {
     let t = t0 + ms(100);
     ack(&mut c, t, ms(50), &rtt);
     // An ACK "sent" after it was received yields a zero sample
-    c.on_ack(t - ms(10), t, MTU, false, &rtt);
+    c.on_ack(t - ms(10), t, MTU, 0, SpaceId::Data, false, &rtt);
     assert!(c.window() >= 4 * MTU);
 }
 
@@ -303,7 +304,7 @@ fn pacing_rate_and_metrics() {
     assert_eq!(c.pacing_rate(), Some(expected));
     let metrics = c.metrics();
     assert_eq!(metrics.congestion_window, c.window());
-    assert_eq!(metrics.pacing_rate, Some(expected * 8));
+    assert_eq!(metrics.pacing_rate, Some(expected));
 }
 
 #[test]

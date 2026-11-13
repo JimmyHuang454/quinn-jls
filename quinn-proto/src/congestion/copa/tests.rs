@@ -375,3 +375,80 @@ fn pacing_is_capped_for_one_rtt_after_a_restore() {
     assert!(c.pace_cap.is_none());
     assert!(c.pacing_rate().unwrap() > uncapped / 2);
 }
+
+#[test]
+fn gentle_aligned_probe_holds_bdp_instead_of_collapsing() {
+    let make = |gentle: bool, t0: Instant| {
+        let mut auto = CopaAutoConfig::default();
+        auto.delta_range(0.001, 0.4)
+            .probe_epoch(Some(t0))
+            .probe_timing(Duration::from_secs(20), Duration::from_secs(2))
+            .probe_rtts(0, Duration::ZERO)
+            .gentle_probe(gentle);
+        let mut config = CopaConfig::copa_nc();
+        config.delta(0.1).adaptive(Some(auto));
+        let (mut c, t0) = copa(config);
+        let rtt = rtt_estimator(ms(60));
+        let mut t = ten_ms_queue(&mut c, t0, &rtt);
+        // Settle past the initial post-slow-start probe into steady state before slot 1 (20 s).
+        while !c.auto.as_ref().unwrap().first_probe_done() {
+            t += ms(25);
+            ack(&mut c, t, ms(60), &rtt);
+        }
+        // Establish 50 ms RTT_min, 60 ms RTT_standing, and 60 * MTU cwnd right before slot 1.
+        ack(&mut c, t0 + Duration::from_secs(19) + ms(900), ms(50), &rtt);
+        for i in 1..=5 {
+            ack(&mut c, t0 + Duration::from_secs(19) + ms(900 + i * 19), ms(60), &rtt);
+        }
+        c.window = (60 * MTU) as f64;
+        (c, t0, rtt)
+    };
+
+    let t0 = Instant::now();
+    let (mut gentle, _, rtt) = make(true, t0);
+    let (mut legacy, _, _) = make(false, t0);
+    let pre_probe_window = gentle.window();
+    let probe_start = t0 + Duration::from_secs(20);
+
+    // Feed 30 ms jitter spikes throughout the 2 s aligned probe in slot 1.
+    for step in 0..360 {
+        let now = probe_start + ms(20 + step * 5);
+        ack(&mut gentle, now, ms(80), &rtt);
+        ack(&mut legacy, now, ms(80), &rtt);
+    }
+
+    assert!(
+        gentle.probe_saved.is_some(),
+        "gentle probe should remain active inside slot 1"
+    );
+    assert!(
+        legacy.delta() > gentle.delta(),
+        "legacy probe jumps to delta_max ({}) while gentle keeps current delta ({})",
+        legacy.delta(),
+        gentle.delta()
+    );
+    // Expected 0.5 * BDP ~ 0.5 * (60 * MTU * 50 / 60) = 25 * MTU: holds ~50% BDP without collapsing.
+    assert!(
+        gentle.window() >= 20 * MTU && gentle.window() <= 35 * MTU,
+        "gentle probe window {} should hold near 0.5 * BDP (~{} B)",
+        gentle.window(),
+        25 * MTU
+    );
+    assert!(
+        legacy.window() < gentle.window(),
+        "legacy delta_max collapses under jitter ({}) below gentle hold ({})",
+        legacy.window(),
+        gentle.window()
+    );
+
+    // Exit slot 1 at t = 22.05 s: window restores to pre-probe window with a 1-SRTT pace cap.
+    ack(&mut gentle, probe_start + Duration::from_secs(2) + ms(50), ms(50), &rtt);
+    assert!(gentle.probe_saved.is_none());
+    assert!(
+        gentle.window() >= pre_probe_window - MTU,
+        "restored window {} should match pre-probe {}",
+        gentle.window(),
+        pre_probe_window
+    );
+    assert!(gentle.pace_cap.is_some());
+}

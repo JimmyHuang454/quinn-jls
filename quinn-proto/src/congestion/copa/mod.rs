@@ -121,9 +121,13 @@ struct ProbeSaved {
     rate: f64,
     rtt_min: Duration,
     congested: bool,
-    /// A drain (window held at its minimum) rather than a probe at delta_max: always restored
-    /// in full, since the window was cut on purpose
+    /// A drain (window held below BDP) rather than a low-load probe: always restored in full,
+    /// since the window was cut on purpose
     drain: bool,
+    /// A gentle BDP-based low-load probe for `j` rather than a `delta_max` probe
+    gentle: bool,
+    /// The probe started during the post-slow-start `first_probe` (overshoot window)
+    first: bool,
 }
 
 impl Copa {
@@ -301,22 +305,28 @@ impl Copa {
         }
     }
 
+    fn bdp_hold_window(&self, rtt_min: Duration, ratio: f64) -> f64 {
+        let base = self.trusted_min.unwrap_or(rtt_min).min(rtt_min);
+        let standing = self.standing.unwrap_or(rtt_min).max(base);
+        let bdp = self.window * base.as_secs_f64() / standing.as_secs_f64().max(1e-9);
+        (ratio * bdp).max(self.minimum_window())
+    }
+
     /// Fast recovery around copa-auto's aligned probes, and the short drains between them.
     ///
-    /// A probe sets delta to its maximum, so the window collapses (to a few packets on a jittery
-    /// link); regrowing it through the control law takes seconds. The capacity has not changed
-    /// meanwhile, so the window saved at the start of the probe is restored at its end, as BBR
-    /// does after PROBE_RTT, and for one smoothed RTT packets are paced at the rate from before
-    /// the probe instead of `2 cwnd / RTT_standing`, whose short standing RTT right after the
-    /// probe would send the whole window as a burst. Skipped after a loss or when RTT_min moved
-    /// notably (the path may have changed).
+    /// Legacy `delta_max` probes collapse the window (to a few packets on a jittery link); with
+    /// `gentle_probe` (the default), aligned probes instead hold `drain_window * BDP` (0.5 BDP,
+    /// like a drain), keeping ~50% throughput with no zero-send pause while emptying self-induced
+    /// queues cleanly. At the end of a probe or drain, the pre-probe window is restored and paced
+    /// at the pre-probe rate for one smoothed RTT (instead of `2 cwnd / RTT_standing`, which
+    /// would burst), unless a loss was signalled or `RTT_min` moved notably.
     ///
     /// A drain keeps RTT_min at the propagation delay when several flows keep the queue busy. It
     /// is skipped when a packet found the bottleneck idle recently (RTT_min is then fresh, e.g.
     /// after another flow's drain, which also lines the drains of flows up as in BBR), holds the
     /// window at `drain_window` times the estimated BDP (`cwnd RTT_min / RTT_standing`) for
     /// `2 d_q + srtt` (the queue empties at half the rate, then one RTT to see it), and is then
-    /// restored in full. Returns whether a drain is in progress.
+    /// restored in full. Returns whether a drain or gentle probe is currently holding the window.
     fn fast_recovery(&mut self, now: Instant, rtt_min: Duration) -> bool {
         let Some(auto) = &self.auto else { return false };
         if let Some(slot) = auto.drain_slot(now, self.slow_start)
@@ -335,10 +345,7 @@ impl Copa {
                 }
             }
             if !fresh {
-                let base = self.trusted_min.unwrap_or(rtt_min).min(rtt_min);
-                let standing = self.standing.unwrap_or(rtt_min).max(base);
-                let bdp = self.window * base.as_secs_f64() / standing.as_secs_f64().max(1e-9);
-                self.drain_window = (auto.drain_window() * bdp).max(self.minimum_window());
+                self.drain_window = self.bdp_hold_window(rtt_min, auto.drain_window());
                 let hold = auto.drain_min().max(2 * self.dq + self.srtt);
                 self.drain_until = Some(now + hold);
             }
@@ -347,22 +354,36 @@ impl Copa {
         if !draining {
             self.drain_until = None;
         }
-        let probing = draining || auto.in_aligned_probe(now, self.slow_start);
+        let gentle = !draining && auto.in_gentle_probe(now, self.slow_start);
+        let holding = draining || gentle;
+        let probing = holding || auto.in_aligned_probe(now, self.slow_start);
         match (probing, self.probe_saved) {
             (true, None) => {
+                if gentle {
+                    self.drain_window = self.bdp_hold_window(rtt_min, auto.drain_window());
+                }
                 self.probe_saved = Some(ProbeSaved {
                     window: self.window,
                     rate: self.pacing_rate().map_or(0.0, |r| r as f64),
                     rtt_min,
                     congested: false,
                     drain: draining,
+                    gentle,
+                    first: gentle && !auto.first_probe_done(),
                 });
             }
             (false, Some(saved)) => {
                 self.probe_saved = None;
                 // The queue was emptied: RTT_min is now the propagation delay
                 self.trusted_min = Some(rtt_min);
-                let ratio = if saved.drain { 1.0 } else { auto.recovery() };
+                self.last_nearly_empty = now;
+                let ratio = if saved.drain {
+                    1.0
+                } else if saved.gentle && !saved.first {
+                    if auto.recovery() > 0.0 { 1.0 } else { 0.0 }
+                } else {
+                    auto.recovery()
+                };
                 let moved =
                     auto.rtt_min_changed(saved.rtt_min.as_secs_f64(), rtt_min.as_secs_f64());
                 if ratio > 0.0 && !saved.congested && (saved.drain || !moved) {
@@ -375,7 +396,7 @@ impl Copa {
             }
             _ => {}
         }
-        draining
+        holding
     }
 
     fn reset_velocity(&mut self) {
@@ -440,7 +461,18 @@ impl Controller for Copa {
         // eq. (2) of the paper
         let dq = standing.saturating_sub(rtt_min);
         self.dq = dq;
-        self.update_mode(now, dq, rtt_min);
+        let holding = self.drain_until.is_some_and(|until| now < until)
+            || (!self.competitive
+                && self
+                    .auto
+                    .as_ref()
+                    .is_some_and(|auto| auto.in_gentle_probe(now, self.slow_start)));
+        if holding {
+            // Do not mistake an intentional BDP hold (probe/drain) for a competing buffer-filler
+            self.last_nearly_empty = now;
+        } else {
+            self.update_mode(now, dq, rtt_min);
+        }
 
         let mss = self.current_mtu as f64;
         let acked_packets = bytes as f64 / mss;
@@ -753,6 +785,7 @@ pub struct CopaAutoConfig {
     drain_skip: Duration,
     drain_enabled: bool,
     jitter_floor_ms: f64,
+    gentle_probe: bool,
     board: Arc<ProbeBoard>,
 }
 
@@ -905,11 +938,19 @@ impl CopaAutoConfig {
         self
     }
 
+    /// Hold the window gently at `drain_window * BDP` (`0.5 * BDP`) during aligned `j` probes
+    /// instead of jumping `delta` to `delta_max` (`true` by default)
+    pub fn gentle_probe(&mut self, value: bool) -> &mut Self {
+        self.gentle_probe = value;
+        self
+    }
+
     /// The original copa-auto: a probe in every aligned slot and no fast recovery
     pub fn periodic_probes(&mut self) -> &mut Self {
         self.adaptive_probes(false)
             .probe_recovery(0.0)
             .probe_rtts(0, Duration::ZERO)
+            .gentle_probe(false)
     }
 
     /// Align the probes on `epoch` instead of the wall clock (for simulations)
@@ -951,6 +992,7 @@ impl Default for CopaAutoConfig {
             drain_skip: Duration::from_secs(10),
             drain_enabled: true,
             jitter_floor_ms: -1.0,
+            gentle_probe: true,
             board: Arc::default(),
         }
     }

@@ -315,6 +315,20 @@ impl AutoDelta {
         self.first_probe_done && self.in_timed_probe(now, slow_start)
     }
 
+    pub(super) fn first_probe_done(&self) -> bool {
+        self.first_probe_done
+    }
+
+    /// Whether an aligned low-load probe should gently hold the window at `drain_window * BDP`
+    /// (`0.5 * BDP`) rather than jumping `delta` to `delta_max`
+    pub(super) fn in_gentle_probe(&self, now: Instant, slow_start: bool) -> bool {
+        self.probing_jitter()
+            && self.aligned()
+            && self.config.gentle_probe
+            && !slow_start
+            && (!self.first_probe_done || self.in_timed_probe(now, slow_start))
+    }
+
     pub(super) fn recovery(&self) -> f64 {
         self.config.recovery
     }
@@ -391,6 +405,9 @@ impl AutoDelta {
     /// `fallback` is the configured delta, used until the first update.
     pub(super) fn delta(&self, now: Instant, slow_start: bool, fallback: f64) -> f64 {
         if !slow_start && (self.in_round_probe() || self.in_timed_probe(now, slow_start)) {
+            if self.aligned() && self.config.gentle_probe {
+                return self.est.delta.unwrap_or(fallback);
+            }
             return self.config.delta_max;
         }
         self.est.delta.unwrap_or(fallback)
@@ -658,11 +675,6 @@ impl AutoDelta {
     #[cfg(test)]
     pub(super) fn rounds(&self) -> u64 {
         self.rounds
-    }
-
-    #[cfg(test)]
-    pub(super) fn first_probe_done(&self) -> bool {
-        self.first_probe_done
     }
 }
 

@@ -221,10 +221,12 @@ fn c1_copa_auto_single_flow() {
         link.jitter = ms(10);
         link
     };
-    for (name, link, min_ratio) in [
-        ("constant", &plain as &dyn Fn() -> Link, 0.8),
-        ("jitter", &jitter, 0.95),
-        ("variable", &variable_link, 0.85),
+    // During the short [30, 80s] window, two gentle 0.5 BDP probes run on `variable` while
+    // capacity swings +-69% every 500 ms, trimming utilization from ~0.94 to ~0.91.
+    for (name, link, min_util, min_ratio) in [
+        ("constant", &plain as &dyn Fn() -> Link, 0.93, 0.8),
+        ("jitter", &jitter, 0.93, 0.95),
+        ("variable", &variable_link, 0.90, 0.85),
     ] {
         let best = best_fixed_power(link);
         for mode_switching in [true, false] {
@@ -236,7 +238,7 @@ fn c1_copa_auto_single_flow() {
             assert!(est.dq_target > j, "{ctx}");
             let delta = est.delta.expect("delta");
             assert!((0.001..=0.5).contains(&delta), "{ctx}");
-            assert!(r.utilization > 0.93, "{ctx}");
+            assert!(r.utilization > min_util, "{ctx}");
             let ratio = r.power(0, BASE_RTT) / best;
             assert!(ratio > min_ratio, "{ctx}: power ratio {ratio}");
             if name != "variable" {
@@ -381,14 +383,15 @@ fn c6_drains_keep_rtt_min_with_several_flows() {
 }
 
 /// Drains only when RTT_min is stale: a single flow empties the queue by itself and skips almost
-/// all of them; four flows keep the queue busy, so they drain (and stay fair, see c6)
+/// all of them; four flows sharing a lower-BDP bottleneck keep the queue busy even at `delta = 0.5`,
+/// so they drain (`gentle_probe` keeps `j = 0` accurate on `12 Mbit/s` so 4 flows there swing idle)
 #[test]
 fn c7_drains_are_skipped_when_rtt_min_is_fresh() {
-    for (n, mostly_skipped) in [(1usize, true), (4, false)] {
+    for (n, mbps, mostly_skipped) in [(1usize, 12.0, true), (4, 3.0, false)] {
         let sources = (0..n)
             .map(|_| Source::copa(CopaConfig::default()))
             .collect();
-        let mut sim = Sim::new(Link::new(12.0, BASE_RTT), flows(sources));
+        let mut sim = Sim::new(Link::new(mbps, BASE_RTT), flows(sources));
         let epoch = sim.epoch();
         for i in 0..n {
             sim.set_copa(i, copa_auto(epoch, false));
@@ -439,6 +442,43 @@ fn c8_fixed_jitter_and_drain_toggle() {
             assert_eq!((started, skipped), (0, 0));
         }
     }
+}
+
+/// Gentle BDP-based `j` probes avoid the 20 s near-zero stalls caused by `delta_max` probes under
+/// heavy jitter even when probes fire in every slot
+#[test]
+fn c9_gentle_probe_avoids_zero_dips() {
+    let run = |gentle: bool| {
+        let mut sim = Sim::new(
+            jittery_5g(),
+            flows(vec![Source::copa(CopaConfig::copa_nc())]),
+        );
+        let epoch = sim.epoch();
+        let mut auto = CopaAutoConfig::default();
+        auto.probe_epoch(Some(epoch))
+            .adaptive_probes(false)
+            .gentle_probe(gentle);
+        let mut cfg = CopaConfig::copa_nc();
+        cfg.adaptive(Some(auto));
+        sim.set_copa(0, cfg);
+        let r = sim.run(secs(140), secs(20));
+        let est = sim.flows[0]
+            .source
+            .as_copa()
+            .unwrap()
+            .adaptive_estimate()
+            .unwrap();
+        let min1s = r.per_second[0].iter().cloned().fold(f64::MAX, f64::min);
+        (r, est, min1s)
+    };
+    let (legacy_r, _, legacy_min1s) = run(false);
+    let (gentle_r, gentle_est, gentle_min1s) = run(true);
+    assert!(
+        gentle_min1s > 2.0 * legacy_min1s && gentle_min1s > 8e6,
+        "gentle min1s {gentle_min1s:.0} should avoid legacy stalls ({legacy_min1s:.0}): gentle={gentle_r:?}, legacy={legacy_r:?}"
+    );
+    let j = gentle_est.jitter.expect("jitter floor");
+    assert!((0.001..0.015).contains(&j), "gentle jitter={j}");
 }
 
 /// Probe schedules compared by `probe_policy_comparison`

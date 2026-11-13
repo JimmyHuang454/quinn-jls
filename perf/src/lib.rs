@@ -59,6 +59,16 @@ pub struct CommonOpt {
     /// Congestion algorithm to use
     #[clap(long = "congestion")]
     pub cong_alg: Option<CongestionAlgorithm>,
+    /// Fixed jitter floor for copa-auto in ms (< 0 probes online, 0 fixes j=0, > 0 fixes j)
+    #[clap(
+        long = "copa-jitter-ms",
+        default_value_t = -1.0,
+        allow_hyphen_values = true
+    )]
+    pub copa_jitter_ms: f64,
+    /// Enable on-demand queue drains for copa-auto
+    #[clap(long = "copa-drain", default_value_t = true, action = clap::ArgAction::Set)]
+    pub copa_drain: bool,
     /// Maximum number of bytes the peer may transmit without acknowledgement on any one stream
     /// before becoming blocked.
     ///
@@ -105,7 +115,9 @@ impl CommonOpt {
         }
 
         if let Some(cong_alg) = self.cong_alg {
-            transport.congestion_controller_factory(cong_alg.build());
+            transport.congestion_controller_factory(
+                cong_alg.build_with(self.copa_jitter_ms, self.copa_drain),
+            );
         }
 
         if let Some(stream_receive_window) = self.stream_receive_window {
@@ -220,6 +232,14 @@ pub enum CongestionAlgorithm {
 
 impl CongestionAlgorithm {
     pub fn build(self) -> Arc<dyn ControllerFactory + Send + Sync + 'static> {
+        self.build_with(-1.0, true)
+    }
+
+    pub fn build_with(
+        self,
+        copa_jitter_ms: f64,
+        copa_drain: bool,
+    ) -> Arc<dyn ControllerFactory + Send + Sync + 'static> {
         match self {
             Self::Cubic => Arc::new(congestion::CubicConfig::default()),
             Self::Bbr1 => Arc::new(congestion::Bbr1Config::default()),
@@ -228,8 +248,22 @@ impl CongestionAlgorithm {
             Self::NewReno => Arc::new(congestion::NewRenoConfig::default()),
             Self::Copa => Arc::new(congestion::CopaConfig::default()),
             Self::CopaNc => Arc::new(congestion::CopaConfig::copa_nc()),
-            Self::CopaAuto => Arc::new(congestion::CopaConfig::copa_auto()),
-            Self::CopaAutoNc => Arc::new(congestion::CopaConfig::copa_auto_nc()),
+            Self::CopaAuto => {
+                let mut auto = congestion::CopaAutoConfig::default();
+                auto.jitter_floor_ms(copa_jitter_ms)
+                    .drain_enabled(copa_drain);
+                let mut cfg = congestion::CopaConfig::default();
+                cfg.adaptive(Some(auto));
+                Arc::new(cfg)
+            }
+            Self::CopaAutoNc => {
+                let mut auto = congestion::CopaAutoConfig::default();
+                auto.jitter_floor_ms(copa_jitter_ms)
+                    .drain_enabled(copa_drain);
+                let mut cfg = congestion::CopaConfig::copa_nc();
+                cfg.adaptive(Some(auto));
+                Arc::new(cfg)
+            }
         }
     }
 }
@@ -239,3 +273,39 @@ pub static PERF_CIPHER_SUITES: &[rustls::SupportedCipherSuite] = &[
     cipher_suite::TLS13_AES_256_GCM_SHA384,
     cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_copa_auto_options() {
+        let opt = CommonOpt::try_parse_from([
+            "perf",
+            "--congestion",
+            "copa-auto",
+            "--copa-jitter-ms",
+            "-1",
+        ])
+        .unwrap();
+        assert_eq!(opt.copa_jitter_ms, -1.0);
+        assert!(opt.copa_drain);
+
+        let opt = CommonOpt::try_parse_from([
+            "perf",
+            "--congestion",
+            "copa-auto-nc",
+            "--copa-jitter-ms",
+            "10",
+            "--copa-drain=false",
+        ])
+        .unwrap();
+        assert_eq!(opt.copa_jitter_ms, 10.0);
+        assert!(!opt.copa_drain);
+        opt.build_transport_config(
+            #[cfg(feature = "qlog")]
+            "test",
+        )
+        .unwrap();
+    }
+}

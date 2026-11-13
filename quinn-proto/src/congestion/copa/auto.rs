@@ -192,11 +192,16 @@ impl AutoDelta {
             anchor_slot = (since_epoch / period).floor() as u64;
             since_epoch.rem_euclid(period)
         };
+        let fixed_jitter = (config.jitter_floor_ms >= 0.0).then(|| config.jitter_floor_ms * 1e-3);
+        let est = CopaAutoEstimate {
+            jitter: fixed_jitter,
+            ..CopaAutoEstimate::default()
+        };
         Self {
             config,
             anchor: now,
             anchor_phase,
-            est: CopaAutoEstimate::default(),
+            est,
             last_ack: None,
             round_start: None,
             round: Accumulator::default(),
@@ -205,8 +210,8 @@ impl AutoDelta {
             seg_probe: false,
             seg_app_limited: false,
             settle_halves: 0,
-            first_probe_done: false,
-            aligned_probe_seen: false,
+            first_probe_done: fixed_jitter.is_some(),
+            aligned_probe_seen: fixed_jitter.is_some(),
             last_probe_dq: 0.0,
             probe_dq_sum: 0.0,
             probe_acks: 0,
@@ -216,7 +221,7 @@ impl AutoDelta {
             slot_duration: 0.0,
             fallback_level: 0,
             agreeing: 0,
-            stable: false,
+            stable: fixed_jitter.is_some(),
             reset_next: false,
             rtt_min_at_probe: None,
             probe_hi: 0.0,
@@ -225,6 +230,10 @@ impl AutoDelta {
 
     pub(super) fn estimate(&self) -> CopaAutoEstimate {
         self.est
+    }
+
+    pub(super) fn probing_jitter(&self) -> bool {
+        self.config.jitter_floor_ms < 0.0
     }
 
     fn aligned(&self) -> bool {
@@ -238,6 +247,9 @@ impl AutoDelta {
     /// Round-based low-load probe: two half-periods in every `probe_every`, or with aligned
     /// probes only the first probe after the slow start, until the queue it left has drained
     fn in_round_probe(&self) -> bool {
+        if !self.probing_jitter() {
+            return false;
+        }
         if self.aligned() {
             return !self.first_probe_done;
         }
@@ -258,7 +270,7 @@ impl AutoDelta {
     }
 
     fn in_timed_probe(&self, now: Instant, slow_start: bool) -> bool {
-        if !self.aligned() || slow_start {
+        if !self.probing_jitter() || !self.aligned() || slow_start {
             return false;
         }
         if !self.config.adaptive_probes {
@@ -313,6 +325,7 @@ impl AutoDelta {
     /// several flows keep the queue busy and `RTT_min` creeps up. Returns the slot to drain.
     pub(super) fn drain_slot(&self, now: Instant, slow_start: bool) -> Option<u64> {
         if !self.config.adaptive_probes
+            || !self.config.drain_enabled
             || self.config.drain_min.is_zero()
             || !self.aligned()
             || !self.first_probe_done
@@ -341,6 +354,9 @@ impl AutoDelta {
     /// and until `j` is settled; afterwards only in the fallback slots (wall-clock multiples of
     /// the fallback period, shared by the flows of a host) or after a notable `RTT_min` change
     fn wants_probe(&self, slot: u64) -> bool {
+        if !self.probing_jitter() {
+            return false;
+        }
         if !self.config.adaptive_probes || !self.first_probe_done || !self.stable {
             return true;
         }
@@ -394,7 +410,8 @@ impl AutoDelta {
 
         if self.config.adaptive_probes && self.aligned() {
             // A path change shows as a jump of RTT_min: the floor measured before may not hold
-            if let Some(r0) = self.rtt_min_at_probe
+            if self.probing_jitter()
+                && let Some(r0) = self.rtt_min_at_probe
                 && self.stable
                 && self.rtt_min_changed(r0, s.rtt_min.as_secs_f64())
             {
@@ -405,7 +422,8 @@ impl AutoDelta {
                 let own = self.wanted_duration(s.srtt);
                 // Register ahead, once this slot's probe window is over (so that the outcome of a
                 // probe in this slot is known), for the flows deciding at the next boundary
-                if self.first_probe_done
+                if self.probing_jitter()
+                    && self.first_probe_done
                     && self.phase(s.now) >= self.config.probe_duration.as_secs_f64()
                 {
                     let request = self.wants_probe(slot + 1);
@@ -416,13 +434,17 @@ impl AutoDelta {
                     && self.phase(s.now) < self.config.probe_duration.as_secs_f64()
                 {
                     self.decided_slot = Some(slot);
-                    // Late registration still reaches the flows whose first ACK comes later
-                    let board = &self.config.board;
-                    board.publish(slot, own, self.wants_probe(slot));
-                    let length = board.length(slot).unwrap_or(own).max(own);
-                    self.slot_duration = length.as_secs_f64();
-                    if board.requested(slot) || self.forced(slot) {
-                        self.probing_slot = Some(slot);
+                    if self.probing_jitter() {
+                        // Late registration still reaches the flows whose first ACK comes later
+                        let board = &self.config.board;
+                        board.publish(slot, own, self.wants_probe(slot));
+                        let length = board.length(slot).unwrap_or(own).max(own);
+                        self.slot_duration = length.as_secs_f64();
+                        if board.requested(slot) || self.forced(slot) {
+                            self.probing_slot = Some(slot);
+                        }
+                    } else {
+                        self.slot_duration = own.as_secs_f64();
                     }
                 }
             }
@@ -1131,5 +1153,31 @@ mod tests {
             (inv - (10.0 + 10.0 * MAX_STEP)).abs() < 1e-9,
             "1/delta = {inv}"
         );
+    }
+
+    #[test]
+    fn fixed_jitter_floor_skips_probes_and_respects_drain_toggle() {
+        let epoch = Instant::now();
+        for (value_ms, expected_j, drain_enabled) in
+            [(0.0, 0.0, true), (10.0, 0.01, true), (10.0, 0.01, false)]
+        {
+            let mut c = CopaAutoConfig::default();
+            c.probe_epoch(Some(epoch))
+                .jitter_floor_ms(value_ms)
+                .drain_enabled(drain_enabled);
+            let mut a = AutoDelta::new(Arc::new(c), epoch);
+            assert!(a.first_probe_done());
+            assert_eq!(a.estimate().jitter, Some(expected_j));
+            // Even across a forced 600 s slot and an RTT_min jump, no j probe runs
+            for (slot, rtt_min) in [(0u64, ms(40)), (1, ms(70)), (30, ms(70))] {
+                let (probed, drained) =
+                    period(&mut a, epoch + Duration::from_secs(20 * slot), ms(12), rtt_min);
+                assert!(!probed, "value_ms={value_ms}, slot={slot}");
+                assert_eq!(drained, drain_enabled, "value_ms={value_ms}, slot={slot}");
+            }
+            assert_eq!(a.estimate().jitter, Some(expected_j));
+            assert!((a.estimate().base_rtt - (0.070 + expected_j)).abs() < 1e-9);
+            assert!(a.estimate().delta.is_some());
+        }
     }
 }

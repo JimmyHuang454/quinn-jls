@@ -410,6 +410,37 @@ fn c7_drains_are_skipped_when_rtt_min_is_fresh() {
     }
 }
 
+#[test]
+fn c8_fixed_jitter_and_drain_toggle() {
+    for drain_enabled in [false, true] {
+        let n = 4usize;
+        let sources = (0..n)
+            .map(|_| Source::copa(CopaConfig::default()))
+            .collect();
+        let mut sim = Sim::new(Link::new(12.0, BASE_RTT), flows(sources));
+        let epoch = sim.epoch();
+        for i in 0..n {
+            let mut auto = CopaAutoConfig::default();
+            auto.probe_epoch(Some(epoch))
+                .jitter_floor_ms(1.0)
+                .drain_enabled(drain_enabled);
+            let mut cfg = CopaConfig::copa_nc();
+            cfg.adaptive(Some(auto));
+            sim.set_copa(i, cfg);
+        }
+        sim.run(secs(120), secs(20));
+        let copa = sim.flows[0].source.as_copa().unwrap();
+        assert_eq!(copa.adaptive_estimate().unwrap().jitter, Some(0.001));
+        let (started, skipped) = copa.drains;
+        if drain_enabled {
+            assert!(started > 0, "drain enabled: {started} started, {skipped} skipped");
+            assert!(copa.min_rtt().unwrap() < BASE_RTT + ms(6));
+        } else {
+            assert_eq!((started, skipped), (0, 0));
+        }
+    }
+}
+
 /// Probe schedules compared by `probe_policy_comparison`
 #[derive(Debug, Clone, Copy)]
 enum ProbePolicy {

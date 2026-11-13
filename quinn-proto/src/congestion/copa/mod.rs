@@ -453,6 +453,9 @@ impl Controller for Copa {
             let excluded =
                 self.drain_until.is_some_and(|until| now < until) || self.pace_cap.is_some();
             if let Some(auto) = &mut self.auto {
+                if !self.slow_start && self.trusted_min.is_none() && !auto.probing_jitter() {
+                    self.trusted_min = Some(rtt_min);
+                }
                 if let Some(trusted) = &mut self.trusted_min {
                     *trusted = (*trusted).min(sample);
                     if auto.is_idle(sample, *trusted) {
@@ -748,6 +751,8 @@ pub struct CopaAutoConfig {
     fallback_max: Duration,
     drain_window: f64,
     drain_skip: Duration,
+    drain_enabled: bool,
+    jitter_floor_ms: f64,
     board: Arc<ProbeBoard>,
 }
 
@@ -883,6 +888,23 @@ impl CopaAutoConfig {
         self
     }
 
+    /// Enable or disable the on-demand queue drains in aligned slots that do not measure `j`
+    /// (`true` by default)
+    pub fn drain_enabled(&mut self, value: bool) -> &mut Self {
+        self.drain_enabled = value;
+        self
+    }
+
+    /// Fixed jitter floor in milliseconds, or negative to probe online (`-1.0` by default)
+    ///
+    /// A negative value enables low-load probing; `0.0` pauses probing and fixes `j = 0`;
+    /// a positive value pauses probing and fixes `j` to `value` ms.
+    pub fn jitter_floor_ms(&mut self, value: f64) -> &mut Self {
+        assert!(value.is_finite(), "jitter_floor_ms must be finite");
+        self.jitter_floor_ms = value;
+        self
+    }
+
     /// The original copa-auto: a probe in every aligned slot and no fast recovery
     pub fn periodic_probes(&mut self) -> &mut Self {
         self.adaptive_probes(false)
@@ -927,6 +949,8 @@ impl Default for CopaAutoConfig {
             fallback_max: Duration::from_secs(600),
             drain_window: 0.5,
             drain_skip: Duration::from_secs(10),
+            drain_enabled: true,
+            jitter_floor_ms: -1.0,
             board: Arc::default(),
         }
     }

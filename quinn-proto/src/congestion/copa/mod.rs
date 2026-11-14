@@ -26,6 +26,7 @@ use crate::packet::SpaceId;
 use crate::{Duration, Instant};
 
 mod auto;
+mod drain;
 mod filter;
 #[cfg(test)]
 mod scenarios;
@@ -36,6 +37,7 @@ mod tests;
 
 pub use auto::CopaAutoEstimate;
 use auto::{AutoDelta, ProbeBoard, Sample};
+use drain::{DrainController, DrainFinished, DrainKind};
 use filter::{Kind, WindowedFilter};
 
 /// Minimum congestion window in packets (as in the ns-3 implementation)
@@ -94,40 +96,22 @@ pub struct Copa {
     prev_vote_dir: i64,
 
     auto: Option<AutoDelta>,
-    /// Window and RTT_min when the current aligned probe began, and whether a loss was signalled
-    /// since (fast recovery)
-    probe_saved: Option<ProbeSaved>,
-    /// Drain in progress until this time, the window held meanwhile, and the last slot drained
-    drain_until: Option<Instant>,
-    drain_window: f64,
-    drained_slot: Option<u64>,
-    /// Last packet that found the bottleneck idle: RTT_min is fresh without a drain
-    last_idle: Option<Instant>,
-    /// RTT_min measured at the end of the last drain or probe, lowered by any smaller sample.
-    /// The idle test for skipping drains compares against it rather than against RTT_min, which
-    /// drifts up with a busy queue and would then make every packet look idle.
-    trusted_min: Option<Duration>,
-    /// After a restore, pace at the rate from before the probe until this time
-    pace_cap: Option<(Instant, f64)>,
+    drain: DrainController,
+    /// Latest timestamp observed via `on_sent`, `on_ack`, or `on_congestion_event`
+    last_time: Instant,
+    /// Saved window/RTT_min for legacy `delta_max` aligned probes (`gentle_probe == false`)
+    legacy_probe: Option<LegacyProbeSaved>,
     /// Drains started and skipped (RTT_min was fresh)
     #[cfg(test)]
     drains: (u64, u64),
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ProbeSaved {
+struct LegacyProbeSaved {
     window: f64,
-    /// Pacing rate (bytes/s) when the probe began
     rate: f64,
     rtt_min: Duration,
     congested: bool,
-    /// A drain (window held below BDP) rather than a low-load probe: always restored in full,
-    /// since the window was cut on purpose
-    drain: bool,
-    /// A gentle BDP-based low-load probe for `j` rather than a `delta_max` probe
-    gentle: bool,
-    /// The probe started during the post-slow-start `first_probe` (overshoot window)
-    first: bool,
 }
 
 impl Copa {
@@ -159,13 +143,9 @@ impl Copa {
             ack_votes: 0,
             prev_vote_dir: 1,
             auto,
-            probe_saved: None,
-            drain_until: None,
-            drain_window: 0.0,
-            drained_slot: None,
-            last_idle: None,
-            trusted_min: None,
-            pace_cap: None,
+            drain: DrainController::new(),
+            last_time: now,
+            legacy_probe: None,
             #[cfg(test)]
             drains: (0, 0),
             config,
@@ -311,98 +291,217 @@ impl Copa {
         }
     }
 
-    fn bdp_hold_window(&self, rtt_min: Duration, ratio: f64) -> f64 {
-        let base = self.trusted_min.unwrap_or(rtt_min).min(rtt_min);
-        let standing = self.standing.unwrap_or(rtt_min).max(base);
-        let bdp = self.window * base.as_secs_f64() / standing.as_secs_f64().max(1e-9);
-        (ratio * bdp).max(self.minimum_window())
+    fn apply_drain_finished(&mut self, now: Instant, finished: DrainFinished, rtt_min: Duration) {
+        self.last_nearly_empty = now;
+        let Some(auto) = &mut self.auto else {
+            return;
+        };
+        if finished.kind == DrainKind::MeasureJitter {
+            auto.finish_gentle_probe(finished.slot, finished.probe_dq, rtt_min);
+        }
+        let recovery = if finished.kind == DrainKind::RefreshRttMin || auto.recovery() > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        if recovery > 0.0 && !finished.congested {
+            let moved_down = finished.rtt_min_at_start > finished.drain_min_rtt
+                && auto.rtt_min_changed(
+                    finished.rtt_min_at_start.as_secs_f64(),
+                    finished.drain_min_rtt.as_secs_f64(),
+                );
+            let target = if moved_down {
+                // Queue inflation was cleared: restore toward estimated true BDP rather than
+                // re-inflating the stale pre-drain queue.
+                finished
+                    .bdp_est
+                    .unwrap_or(finished.saved_window)
+                    .min(finished.saved_window)
+            } else {
+                recovery * finished.saved_window
+            };
+            self.window = self
+                .window
+                .max(target)
+                .clamp(self.minimum_window(), MAX_WINDOW);
+            self.reset_velocity();
+        }
     }
 
-    /// Fast recovery around copa-auto's aligned probes, and the short drains between them.
-    ///
-    /// Legacy `delta_max` probes collapse the window (to a few packets on a jittery link); with
-    /// `gentle_probe` (the default), aligned probes instead hold `drain_window * BDP` (0.5 BDP,
-    /// like a drain), keeping ~50% throughput with no zero-send pause while emptying self-induced
-    /// queues cleanly. At the end of a probe or drain, the pre-probe window is restored and paced
-    /// at the pre-probe rate for one smoothed RTT (instead of `2 cwnd / RTT_standing`, which
-    /// would burst), unless a loss was signalled or `RTT_min` moved notably.
-    ///
-    /// A drain keeps RTT_min at the propagation delay when several flows keep the queue busy. It
-    /// is skipped when a packet found the bottleneck idle recently (RTT_min is then fresh, e.g.
-    /// after another flow's drain, which also lines the drains of flows up as in BBR), holds the
-    /// window at `drain_window` times the estimated BDP (`cwnd RTT_min / RTT_standing`) for
-    /// `2 d_q + srtt` (the queue empties at half the rate, then one RTT to see it), and is then
-    /// restored in full. Returns whether a drain or gentle probe is currently holding the window.
-    fn fast_recovery(&mut self, now: Instant, rtt_min: Duration) -> bool {
-        let Some(auto) = &self.auto else { return false };
-        if let Some(slot) = auto.drain_slot(now, self.slow_start)
-            && self.drained_slot != Some(slot)
-        {
-            self.drained_slot = Some(slot);
-            let fresh = self
-                .last_idle
-                .is_some_and(|t| now.saturating_duration_since(t) < auto.drain_skip());
-            #[cfg(test)]
-            {
-                if fresh {
-                    self.drains.1 += 1;
-                } else {
-                    self.drains.0 += 1;
-                }
-            }
-            if !fresh {
-                self.drain_window = self.bdp_hold_window(rtt_min, auto.drain_window());
-                let hold = auto.drain_min().max(2 * self.dq + self.srtt);
-                self.drain_until = Some(now + hold);
-            }
+    /// Legacy fast recovery for `gentle_probe == false` (`delta_max` aligned probes)
+    fn legacy_probe_recovery(&mut self, now: Instant, rtt_min: Duration) {
+        let Some(auto) = &self.auto else { return };
+        if auto.gentle_probe() {
+            self.legacy_probe = None;
+            return;
         }
-        let draining = self.drain_until.is_some_and(|until| now < until);
-        if !draining {
-            self.drain_until = None;
-        }
-        let gentle = !draining && auto.in_gentle_probe(now, self.slow_start);
-        let holding = draining || gentle;
-        let probing = holding || auto.in_aligned_probe(now, self.slow_start);
-        match (probing, self.probe_saved) {
+        let probing = auto.in_aligned_probe(now, self.slow_start);
+        match (probing, self.legacy_probe) {
             (true, None) => {
-                if gentle {
-                    self.drain_window = self.bdp_hold_window(rtt_min, auto.drain_window());
-                }
-                self.probe_saved = Some(ProbeSaved {
+                self.legacy_probe = Some(LegacyProbeSaved {
                     window: self.window,
                     rate: self.pacing_rate().map_or(0.0, |r| r as f64),
                     rtt_min,
                     congested: false,
-                    drain: draining,
-                    gentle,
-                    first: gentle && !auto.first_probe_done(),
                 });
             }
             (false, Some(saved)) => {
-                self.probe_saved = None;
-                // The queue was emptied: RTT_min is now the propagation delay
-                self.trusted_min = Some(rtt_min);
+                self.legacy_probe = None;
+                self.drain.set_trusted_min(rtt_min);
                 self.last_nearly_empty = now;
-                let ratio = if saved.drain {
-                    1.0
-                } else if saved.gentle && !saved.first {
-                    if auto.recovery() > 0.0 { 1.0 } else { 0.0 }
-                } else {
-                    auto.recovery()
-                };
+                let ratio = auto.recovery();
                 let moved =
                     auto.rtt_min_changed(saved.rtt_min.as_secs_f64(), rtt_min.as_secs_f64());
-                if ratio > 0.0 && !saved.congested && (saved.drain || !moved) {
+                if ratio > 0.0 && !saved.congested && !moved {
                     self.window = self.window.max(ratio * saved.window).min(MAX_WINDOW);
                     self.reset_velocity();
-                    if saved.rate > 0.0 {
-                        self.pace_cap = Some((now + self.srtt, saved.rate));
+                    if saved.rate > 0.0 && !self.srtt.is_zero() {
+                        self.drain.start_recovery_cap(now + self.srtt, saved.rate);
                     }
                 }
             }
             _ => {}
         }
-        holding
+    }
+
+    /// Drive `DrainController` for `RefreshRttMin` drains and gentle `MeasureJitter` probes.
+    /// Returns `true` while a drain/calibration is active and pausing the Copa cwnd law.
+    fn drive_drain(
+        &mut self,
+        now: Instant,
+        sample: Duration,
+        bytes: u64,
+        rtt_min: Duration,
+        standing: Duration,
+        dq: Duration,
+    ) -> bool {
+        let Some(auto) = &self.auto else {
+            return false;
+        };
+        if self.drain.is_draining() {
+            let jitter = auto.estimate().jitter;
+            if let Some(finished) = self.drain.on_ack(
+                now,
+                sample,
+                bytes,
+                rtt_min,
+                standing,
+                dq,
+                self.srtt,
+                jitter,
+            ) {
+                self.apply_drain_finished(now, finished, rtt_min);
+                return false;
+            }
+            if let Some(w) = self.drain.current_window(now, self.srtt, self.minimum_window()) {
+                self.window = w.clamp(self.minimum_window(), MAX_WINDOW);
+            }
+            return true;
+        }
+
+        if !self.drain.is_normal() {
+            return false;
+        }
+
+        // 1. Initial post-slow-start gentle jitter calibration (replaces multi-half-period lockup)
+        if auto.wants_initial_gentle_measure(self.slow_start) {
+            let rate = self.pacing_rate().map_or(0.0, |r| r as f64);
+            let max_dur = (8 * self.srtt).clamp(
+                Duration::from_millis(200),
+                Duration::from_millis(600),
+            );
+            self.drain.start(
+                DrainKind::MeasureJitter,
+                None,
+                now,
+                self.srtt,
+                rtt_min,
+                standing,
+                dq,
+                self.window,
+                self.minimum_window(),
+                rate,
+                max_dur,
+                false,
+            );
+            if let Some(w) = self.drain.current_window(now, self.srtt, self.minimum_window()) {
+                self.window = w.clamp(self.minimum_window(), MAX_WINDOW);
+            }
+            return true;
+        }
+
+        // 2. Aligned slot `MeasureJitter` (measures `j` and refreshes `RTT_min` in one pass)
+        if let Some((slot, slot_dur, hold_full)) =
+            auto.current_aligned_probe_slot(now, self.slow_start, self.srtt)
+            && self.drain.evaluated_slot() != Some(slot)
+        {
+            self.drain.mark_slot_evaluated(slot);
+            let rate = self.pacing_rate().map_or(0.0, |r| r as f64);
+            self.drain.start(
+                DrainKind::MeasureJitter,
+                Some(slot),
+                now,
+                self.srtt,
+                rtt_min,
+                standing,
+                dq,
+                self.window,
+                self.minimum_window(),
+                rate,
+                slot_dur,
+                hold_full,
+            );
+            if let Some(w) = self.drain.current_window(now, self.srtt, self.minimum_window()) {
+                self.window = w.clamp(self.minimum_window(), MAX_WINDOW);
+            }
+            return true;
+        }
+
+        // 3. Aligned slot `RefreshRttMin` (triggered only on drift suspicion or board request)
+        if let Some(slot) = auto.drain_slot(now, self.slow_start)
+            && self.drain.evaluated_slot() != Some(slot)
+        {
+            let board_req = auto.drain_requested_on_board(slot);
+            let should_drain = self.drain.should_drain_slot(
+                now,
+                slot,
+                rtt_min,
+                auto.drain_skip(),
+                board_req,
+            );
+            #[cfg(test)]
+            {
+                if should_drain {
+                    self.drains.0 += 1;
+                } else {
+                    self.drains.1 += 1;
+                }
+            }
+            if should_drain {
+                auto.request_drain_on_board(slot);
+                let rate = self.pacing_rate().map_or(0.0, |r| r as f64);
+                self.drain.start(
+                    DrainKind::RefreshRttMin,
+                    Some(slot),
+                    now,
+                    self.srtt,
+                    rtt_min,
+                    standing,
+                    dq,
+                    self.window,
+                    self.minimum_window(),
+                    rate,
+                    auto.drain_min(),
+                    false,
+                );
+                if let Some(w) = self.drain.current_window(now, self.srtt, self.minimum_window()) {
+                    self.window = w.clamp(self.minimum_window(), MAX_WINDOW);
+                }
+                return true;
+            }
+        }
+
+        false
     }
 
     fn reset_velocity(&mut self) {
@@ -420,18 +519,33 @@ impl Copa {
     ///
     /// Reported to the connection as [`ControllerMetrics::pacing_rate`], which drives the pacer.
     pub(super) fn pacing_rate(&self) -> Option<u64> {
+        if let Some(drain_rate) = self.drain.drain_pacing_rate() {
+            return Some(drain_rate as u64);
+        }
         // Twice cwnd / RTT_standing, to accommodate pacing imperfections (section 2.1)
         let standing = self.standing?.as_secs_f64();
         if standing <= 0.0 {
             return None;
         }
         let rate = 2.0 * self.window / standing;
-        let rate = self.pace_cap.map_or(rate, |(_, cap)| rate.min(cap));
+        let rate = self
+            .drain
+            .recovery_pace_cap(self.last_time)
+            .unwrap_or(rate)
+            .min(rate);
         Some(rate as u64)
     }
 }
 
 impl Controller for Copa {
+    fn on_sent(&mut self, now: Instant, _bytes: u64, _last_packet_number: u64) {
+        self.last_time = self.last_time.max(now);
+        if let Some(finished) = self.drain.poll_expiry(now, self.srtt, self.rtt_min.get()) {
+            let rtt_min = self.rtt_min.get().unwrap_or(finished.rtt_min_at_start);
+            self.apply_drain_finished(now, finished, rtt_min);
+        }
+    }
+
     fn on_ack(
         &mut self,
         now: Instant,
@@ -442,11 +556,16 @@ impl Controller for Copa {
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
+        self.last_time = self.last_time.max(now);
         let sample = now.saturating_duration_since(sent);
         // The connection updates its RTT estimator after the congestion controller has seen the
         // acknowledged packets, so the very first samples fall back to the initial RTT
         self.srtt = rtt.get();
         let srtt = self.srtt;
+        if let Some(finished) = self.drain.poll_expiry(now, srtt, self.rtt_min.get()) {
+            let rtt_min = self.rtt_min.get().unwrap_or(finished.rtt_min_at_start);
+            self.apply_drain_finished(now, finished, rtt_min);
+        }
 
         self.rtt_min.update(
             now,
@@ -467,15 +586,16 @@ impl Controller for Copa {
         // eq. (2) of the paper
         let dq = standing.saturating_sub(rtt_min);
         self.dq = dq;
-        let holding = self.drain_until.is_some_and(|until| now < until)
+        self.drain.on_ack_bw(now, bytes, srtt, self.window, app_limited);
+
+        let holding = self.drain.is_draining()
             || (!self.competitive
-                && self.auto.as_ref().is_some_and(|auto| {
-                    self.slow_start
-                        || !auto.has_estimate()
-                        || auto.in_gentle_probe(now, self.slow_start)
-                }));
+                && self
+                    .auto
+                    .as_ref()
+                    .is_some_and(|auto| self.slow_start || !auto.has_estimate()));
         if holding {
-            // Do not mistake an intentional BDP hold (probe/drain) for a competing buffer-filler
+            // Do not mistake an intentional probe/drain for a competing buffer-filler
             self.last_nearly_empty = now;
         } else {
             self.update_mode(now, dq, rtt_min);
@@ -483,24 +603,13 @@ impl Controller for Copa {
 
         let mss = self.current_mtu as f64;
         let acked_packets = bytes as f64 / mss;
-        if self.pace_cap.is_some_and(|(until, _)| now >= until) {
-            self.pace_cap = None;
-        }
         if !self.competitive {
             // The default mode uses the configured delta, or the one chosen by copa-auto
             self.delta = self.config.delta;
-            let excluded =
-                self.drain_until.is_some_and(|until| now < until) || self.pace_cap.is_some();
+            let excluded = self.drain.is_draining() || self.drain.is_recovering();
             if let Some(auto) = &mut self.auto {
-                if !self.slow_start && self.trusted_min.is_none() && !auto.probing_jitter() {
-                    self.trusted_min = Some(rtt_min);
-                }
-                if let Some(trusted) = &mut self.trusted_min {
-                    *trusted = (*trusted).min(sample);
-                    if auto.is_idle(sample, *trusted) {
-                        self.last_idle = Some(now);
-                    }
-                }
+                self.drain.observe_sample(now, sample, dq, app_limited);
+                let managed_probe = auto.gentle_probe();
                 auto.on_ack(
                     Sample {
                         now,
@@ -512,21 +621,26 @@ impl Controller for Copa {
                         competitive: false,
                         app_limited,
                         excluded,
+                        managed_probe,
                     },
                     self.delta,
                 );
                 self.delta = auto.delta(now, self.slow_start, self.config.delta);
-                if self.fast_recovery(now, rtt_min) {
-                    // Draining: the window is held below the BDP, the control law is paused
-                    self.window = self.drain_window;
+                if managed_probe {
+                    self.legacy_probe = None;
+                } else {
+                    self.legacy_probe_recovery(now, rtt_min);
+                }
+                if self.drive_drain(now, sample, bytes, rtt_min, standing, dq) {
+                    // Draining: pacing regulates the queue gently without hard-locking cwnd below
+                    // in_flight; normal Copa cwnd adjustments are paused until exit.
                     return;
                 }
             }
         } else {
-            // A probe interrupted by the competitive mode is not restored
-            self.probe_saved = None;
-            self.drain_until = None;
-            self.pace_cap = None;
+            // A probe/drain interrupted by the competitive mode is not restored
+            self.legacy_probe = None;
+            self.drain.abort();
             if let Some(auto) = &mut self.auto {
                 // Keeps the round clock running; competitive half-periods are discarded
                 auto.on_ack(
@@ -540,6 +654,7 @@ impl Controller for Copa {
                         competitive: true,
                         app_limited,
                         excluded: true,
+                        managed_probe: auto.gentle_probe(),
                     },
                     self.delta,
                 );
@@ -597,12 +712,16 @@ impl Controller for Copa {
         _largest_lost: u64,
         _space: SpaceId,
     ) {
-        if let Some(saved) = &mut self.probe_saved {
+        self.last_time = self.last_time.max(now);
+        self.drain
+            .mark_congestion(is_persistent_congestion, self.config.mode_switching);
+        if let Some(saved) = &mut self.legacy_probe {
             saved.congested = true;
         }
         if is_persistent_congestion {
             // Comparable to a TCP retransmission timeout, which the paper does not cover: as TCP
             // does (RFC 5681), restart from the minimum window in slow start
+            self.drain.abort();
             self.window = self.minimum_window();
             self.slow_start = true;
             self.reset_velocity();

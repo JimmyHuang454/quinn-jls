@@ -369,11 +369,12 @@ fn pacing_is_capped_for_one_rtt_after_a_restore() {
     let rtt = rtt_estimator(ms(60));
     let t = ten_ms_queue(&mut c, t0, &rtt);
     let uncapped = c.pacing_rate().unwrap();
-    c.pace_cap = Some((t + ms(60), uncapped as f64 / 4.0));
+    c.drain
+        .set_recovery_cap_for_test(t + ms(60), uncapped as f64 / 4.0);
     assert_eq!(c.pacing_rate(), Some(uncapped / 4));
     // The cap ends one smoothed RTT later
     ack(&mut c, t + ms(61), ms(60), &rtt);
-    assert!(c.pace_cap.is_none());
+    assert!(!c.drain.is_recovering());
     assert!(c.pacing_rate().unwrap() > uncapped / 2);
 }
 
@@ -399,7 +400,12 @@ fn gentle_aligned_probe_holds_bdp_instead_of_collapsing() {
         // Establish 50 ms RTT_min, 60 ms RTT_standing, and 60 * MTU cwnd right before slot 1.
         ack(&mut c, t0 + Duration::from_secs(19) + ms(900), ms(50), &rtt);
         for i in 1..=5 {
-            ack(&mut c, t0 + Duration::from_secs(19) + ms(900 + i * 19), ms(60), &rtt);
+            ack(
+                &mut c,
+                t0 + Duration::from_secs(19) + ms(900 + i * 19),
+                ms(60),
+                &rtt,
+            );
         }
         c.window = (60 * MTU) as f64;
         (c, t0, rtt)
@@ -409,18 +415,23 @@ fn gentle_aligned_probe_holds_bdp_instead_of_collapsing() {
     let (mut gentle, _, rtt) = make(true, t0);
     let (mut legacy, _, _) = make(false, t0);
     let pre_probe_window = gentle.window();
+    let pre_probe_rate = gentle.pacing_rate().unwrap();
     let probe_start = t0 + Duration::from_secs(20);
 
-    // Feed 30 ms jitter spikes throughout the 2 s aligned probe in slot 1.
-    for step in 0..360 {
+    // Feed 30 ms jitter spikes during the probe in slot 1 (first 200 ms: active calibration).
+    for step in 0..40 {
         let now = probe_start + ms(20 + step * 5);
         ack(&mut gentle, now, ms(80), &rtt);
         ack(&mut legacy, now, ms(80), &rtt);
     }
 
     assert!(
-        gentle.probe_saved.is_some(),
-        "gentle probe should remain active inside slot 1"
+        gentle.drain.is_draining(),
+        "gentle probe should be active via DrainController"
+    );
+    assert!(
+        gentle.pacing_rate().unwrap() < pre_probe_rate,
+        "gentle probe paces smoothly below pre-probe rate"
     );
     assert!(
         legacy.delta() > gentle.delta(),
@@ -428,30 +439,35 @@ fn gentle_aligned_probe_holds_bdp_instead_of_collapsing() {
         legacy.delta(),
         gentle.delta()
     );
-    // Expected 0.5 * BDP ~ 0.5 * (60 * MTU * 50 / 60) = 25 * MTU: holds ~50% BDP without collapsing.
+    // Soft window holds near 0.9 * BDP (~45 * MTU) instead of abruptly dropping to 0.5 * BDP.
     assert!(
-        gentle.window() >= 20 * MTU && gentle.window() <= 35 * MTU,
-        "gentle probe window {} should hold near 0.5 * BDP (~{} B)",
-        gentle.window(),
-        25 * MTU
-    );
-    assert!(
-        legacy.window() < gentle.window(),
-        "legacy delta_max collapses under jitter ({}) below gentle hold ({})",
-        legacy.window(),
+        gentle.window() >= 38 * MTU && gentle.window() <= pre_probe_window,
+        "gentle probe window {} should stay near soft BDP without stalling",
         gentle.window()
     );
 
-    // Exit slot 1 at t = 22.05 s: window restores to pre-probe window with a 1-SRTT pace cap.
-    ack(&mut gentle, probe_start + Duration::from_secs(2) + ms(50), ms(50), &rtt);
-    assert!(gentle.probe_saved.is_none());
+    // Continue through the probe window until plateau early-exit + post-idle sampling finishes.
+    let mut restored_window = None;
+    for step in 40..200 {
+        let now = probe_start + ms(20 + step * 5);
+        ack(&mut gentle, now, ms(80), &rtt);
+        ack(&mut legacy, now, ms(80), &rtt);
+        if restored_window.is_none() && !gentle.drain.is_draining() {
+            restored_window = Some(gentle.window());
+        }
+    }
+
     assert!(
-        gentle.window() >= pre_probe_window - MTU,
-        "restored window {} should match pre-probe {}",
-        gentle.window(),
-        pre_probe_window
+        legacy.window() < gentle.window(),
+        "legacy delta_max collapses under jitter ({}) below gentle ({})",
+        legacy.window(),
+        gentle.window()
     );
-    assert!(gentle.pace_cap.is_some());
+    let restored = restored_window.expect("gentle probe should early-exit after plateau convergence");
+    assert!(
+        restored >= pre_probe_window - MTU,
+        "restored window {restored} should match pre-probe {pre_probe_window}"
+    );
 }
 
 #[test]
@@ -478,4 +494,196 @@ fn copa_auto_decouples_initial_delta_from_competitive_mode() {
     assert!((c.delta() - 0.4).abs() < 1e-12);
     c.on_congestion_event(t + ms(60), t, false, false, MTU, 0, SpaceId::Data);
     assert!((c.delta() - 0.5).abs() < 1e-12);
+}
+
+fn settled_fixed_jitter_copa(t0: Instant, srtt: Duration) -> (Copa, RttEstimator) {
+    let mut auto = CopaAutoConfig::default();
+    auto.probe_epoch(Some(t0))
+        .probe_timing(Duration::from_secs(20), Duration::from_secs(2))
+        .jitter_floor_ms(1.0);
+    let mut config = CopaConfig::copa_nc();
+    config.delta(0.1).adaptive(Some(auto));
+    let mut c = Copa::new(Arc::new(config), t0, MTU as u16);
+    let rtt = rtt_estimator(srtt);
+    c.slow_start = false;
+    c.drain.set_trusted_min(ms(40));
+    // Anchor slot 0 as evaluated so slot 1 (20 s) is the first RefreshRttMin trigger
+    c.drain.mark_slot_evaluated(0);
+    c.window = (60 * MTU) as f64;
+    (c, rtt)
+}
+
+#[test]
+fn drain_smooth_entry_holds_window_while_lowering_pacing() {
+    let t0 = Instant::now();
+    let (mut c, rtt) = settled_fixed_jitter_copa(t0, ms(50));
+    // Prime 50 ms RTT_standing at 60 * MTU window before slot 1 drift
+    ack(&mut c, t0 + Duration::from_secs(9) + ms(900), ms(40), &rtt);
+    let mut t = t0 + Duration::from_secs(19) + ms(900);
+    // Feed > 10 s drifted samples so rtt_min > trusted_min (40 ms) + 1 ms before slot 1 opens
+    for _ in 0..4 {
+        t += ms(15);
+        ack(&mut c, t, ms(48), &rtt);
+    }
+    assert!(!c.drain.is_draining());
+    let pre_window = c.window();
+    let pre_rate = c.pacing_rate().unwrap();
+
+    // First ACK inside slot 1 (20 s) triggers RefreshRttMin drain
+    let drain_start = t0 + Duration::from_secs(20) + ms(10);
+    ack(&mut c, drain_start, ms(48), &rtt);
+    assert_eq!(c.drain.active_kind(), Some(DrainKind::RefreshRttMin));
+    // Smooth entry: at dt = 0, cwnd remains at pre-drain window while pacing rate drops gently
+    assert_eq!(c.window(), pre_window);
+    assert!(c.pacing_rate().unwrap() < pre_rate);
+    assert!(c.pacing_rate().unwrap() > pre_rate * 3 / 10);
+
+    // Midway (~0.5 * srtt) and end (>= 1 * srtt) of the ramp glide smoothly toward ~0.9 * BDP (~45 * MTU)
+    ack(&mut c, drain_start + ms(25), ms(48), &rtt);
+    let mid_window = c.window();
+    assert!(mid_window < pre_window && mid_window > 40 * MTU);
+    ack(&mut c, drain_start + ms(50), ms(48), &rtt);
+    assert!(c.window() <= mid_window && c.window() >= 40 * MTU);
+}
+
+#[test]
+fn drain_exits_early_on_baseline_or_plateau() {
+    // 1. Baseline return after >= 1 * srtt when queue empties back to ~40 ms
+    let t0 = Instant::now();
+    let (mut c, rtt) = settled_fixed_jitter_copa(t0, ms(40));
+    ack(&mut c, t0 + Duration::from_secs(20) + ms(10), ms(46), &rtt);
+    assert_eq!(c.drain.active_kind(), Some(DrainKind::RefreshRttMin));
+    // Halfway through 1 * srtt (20 ms), standing drops to 40 ms but >= 1 * srtt hasn't elapsed yet
+    ack(&mut c, t0 + Duration::from_secs(20) + ms(30), ms(40), &rtt);
+    assert!(c.drain.is_draining());
+    // At >= 1 * srtt (40 ms elapsed) with standing near trusted (40 ms), drain exits immediately
+    ack(&mut c, t0 + Duration::from_secs(20) + ms(55), ms(40), &rtt);
+    assert!(!c.drain.is_draining());
+    assert_eq!(c.drain.trusted_min(), Some(ms(40)));
+
+    // 2. Plateau convergence when physical propagation delay rises (40 ms -> 65 ms)
+    let t0 = Instant::now();
+    let (mut c, rtt) = settled_fixed_jitter_copa(t0, ms(40));
+    let mut t = t0 + Duration::from_secs(20) + ms(10);
+    // Keep RTT at 65 ms across rounds (>= 2 * srtt and 2 flat rounds) well before the 2 s deadline
+    for _ in 0..10 {
+        ack(&mut c, t, ms(65), &rtt);
+        t += ms(45);
+        if !c.drain.is_draining() {
+            break;
+        }
+    }
+    assert!(!c.drain.is_draining());
+    assert!(t.saturating_duration_since(t0 + Duration::from_secs(20)) < ms(450));
+    assert_eq!(c.drain.trusted_min(), Some(ms(65)));
+}
+
+#[test]
+fn non_competitive_drain_ignores_random_loss_but_respects_persistent_congestion() {
+    let t0 = Instant::now();
+    let (mut c, rtt) = settled_fixed_jitter_copa(t0, ms(40));
+    let start = t0 + Duration::from_secs(20) + ms(10);
+    ack(&mut c, start, ms(46), &rtt);
+    let pre_window = 60 * MTU;
+    assert!(c.drain.is_draining());
+
+    // Random non-persistent loss in copa-auto-nc must NOT cancel recovery
+    c.on_congestion_event(start + ms(20), start, false, false, MTU, 1, SpaceId::Data);
+    ack(&mut c, start + ms(55), ms(46), &rtt);
+    ack(&mut c, start + ms(100), ms(40), &rtt);
+    assert!(!c.drain.is_draining());
+    assert!(c.window() >= pre_window);
+
+    // Persistent congestion MUST mark congested and skip restoring up to pre_window
+    let t0 = Instant::now();
+    let (mut c, rtt) = settled_fixed_jitter_copa(t0, ms(40));
+    let start = t0 + Duration::from_secs(20) + ms(10);
+    ack(&mut c, start, ms(50), &rtt);
+    c.window = (20 * MTU) as f64;
+    c.on_congestion_event(start + ms(20), start, true, false, MTU, 2, SpaceId::Data);
+    ack(&mut c, start + ms(60), ms(50), &rtt);
+    ack(&mut c, start + ms(110), ms(50), &rtt);
+    ack(&mut c, start + ms(160), ms(50), &rtt);
+    ack(&mut c, start + ms(210), ms(50), &rtt);
+    assert!(!c.drain.is_draining());
+    assert!(c.window() < pre_window);
+}
+
+#[test]
+fn refresh_drain_backs_off_when_unhelpful_and_resets_on_improvement() {
+    let t0 = Instant::now();
+    let (mut c, rtt) = settled_fixed_jitter_copa(t0, ms(40));
+
+    // Slot 1 (20 s): RTT stays flat at 45 ms (no improvement over rtt_min_at_start = 45 ms) -> backoff 2 slots (next eligible: slot 3)
+    ack(&mut c, t0 + Duration::from_secs(20) + ms(10), ms(45), &rtt);
+    assert_eq!(c.drains, (1, 0));
+    for k in 1..=6 {
+        ack(
+            &mut c,
+            t0 + Duration::from_secs(20) + ms(10 + k * 45),
+            ms(45),
+            &rtt,
+        );
+    }
+    assert!(!c.drain.is_draining());
+    // Force trusted_min back to 40 ms to keep drift suspicion true cleanly
+    c.drain.set_trusted_min(ms(40));
+
+    // Slot 2 (40 s): skipped by slot-multiple backoff
+    ack(&mut c, t0 + Duration::from_secs(40) + ms(10), ms(45), &rtt);
+    assert!(!c.drain.is_draining());
+    assert_eq!(c.drains, (1, 1));
+
+    // Slot 3 (60 s): eligible; again no improvement -> backoff becomes 4 slots (next eligible: slot 7)
+    ack(&mut c, t0 + Duration::from_secs(60) + ms(10), ms(45), &rtt);
+    assert!(c.drain.is_draining());
+    assert_eq!(c.drains, (2, 1));
+    for k in 1..=6 {
+        ack(
+            &mut c,
+            t0 + Duration::from_secs(60) + ms(10 + k * 45),
+            ms(45),
+            &rtt,
+        );
+    }
+    assert!(!c.drain.is_draining());
+    c.drain.set_trusted_min(ms(40));
+
+    // Slots 4, 5, 6 skipped; slot 7 drains and lowers RTT_min (45 ms -> 40 ms) -> resets backoff to 1
+    for slot in [4u64, 5, 6] {
+        ack(
+            &mut c,
+            t0 + Duration::from_secs(slot * 20) + ms(10),
+            ms(45),
+            &rtt,
+        );
+        assert!(!c.drain.is_draining());
+    }
+    assert_eq!(c.drains, (2, 4));
+
+    ack(&mut c, t0 + Duration::from_secs(140) + ms(10), ms(45), &rtt);
+    assert_eq!(c.drains, (3, 4));
+    // Lower RTT sample during drain -> improvement resets backoff_slots to 1
+    ack(&mut c, t0 + Duration::from_secs(140) + ms(60), ms(40), &rtt);
+    assert!(!c.drain.is_draining());
+    // Next slot 8 (160 s) is immediately eligible when drift recurs
+    ack(&mut c, t0 + Duration::from_secs(160) + ms(10), ms(45), &rtt);
+    assert_eq!(c.drains, (4, 4));
+}
+
+#[test]
+fn on_sent_expires_drain_and_recovery_timeouts() {
+    let t0 = Instant::now();
+    let (mut c, rtt) = settled_fixed_jitter_copa(t0, ms(40));
+    let start = t0 + Duration::from_secs(20) + ms(10);
+    ack(&mut c, start, ms(45), &rtt);
+    assert!(c.drain.is_draining());
+
+    // Even if no ACKs arrive for > max_duration, on_sent expires Draining -> Recovering -> Normal
+    c.on_sent(start + Duration::from_secs(3), MTU, 10);
+    assert!(!c.drain.is_draining());
+    assert!(c.drain.is_recovering());
+
+    c.on_sent(start + Duration::from_secs(4), MTU, 11);
+    assert!(c.drain.is_normal());
 }

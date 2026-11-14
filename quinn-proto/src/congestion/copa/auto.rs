@@ -50,6 +50,7 @@ const MAX_STEP: f64 = std::f64::consts::LN_2 * 2.0;
 pub(super) struct ProbeBoard {
     requests: [AtomicU64; 4],
     lengths: [AtomicU64; 4],
+    drain_requests: [AtomicU64; 4],
 }
 
 impl ProbeBoard {
@@ -66,6 +67,14 @@ impl ProbeBoard {
 
     fn requested(&self, slot: u64) -> bool {
         self.requests[(slot % 4) as usize].load(Ordering::Relaxed) == slot + 1
+    }
+
+    fn request_drain(&self, slot: u64) {
+        self.drain_requests[(slot % 4) as usize].fetch_max(slot + 1, Ordering::Relaxed);
+    }
+
+    fn drain_requested(&self, slot: u64) -> bool {
+        self.drain_requests[(slot % 4) as usize].load(Ordering::Relaxed) == slot + 1
     }
 
     /// Longest probe published for `slot`
@@ -91,6 +100,8 @@ pub(super) struct Sample {
     pub(super) app_limited: bool,
     /// The controller is draining or recovering from a probe: not an equilibrium sample
     pub(super) excluded: bool,
+    /// When true, `DrainController` owns `MeasureJitter` sampling and calls `finish_gentle_probe`
+    pub(super) managed_probe: bool,
 }
 
 /// Estimates published after each half-period, for tests and logging
@@ -315,6 +326,7 @@ impl AutoDelta {
         self.first_probe_done && self.in_timed_probe(now, slow_start)
     }
 
+    #[cfg(test)]
     pub(super) fn first_probe_done(&self) -> bool {
         self.first_probe_done
     }
@@ -333,14 +345,73 @@ impl AutoDelta {
         self.est.delta = Some(delta);
     }
 
-    /// Whether an aligned low-load probe should gently hold the window at `drain_window * BDP`
-    /// (`0.5 * BDP`) rather than jumping `delta` to `delta_max`
-    pub(super) fn in_gentle_probe(&self, now: Instant, slow_start: bool) -> bool {
-        self.probing_jitter()
-            && self.aligned()
-            && self.config.gentle_probe
-            && !slow_start
-            && (!self.first_probe_done || self.in_timed_probe(now, slow_start))
+    /// Whether an aligned low-load probe should use rate-based gentle `MeasureJitter`
+    /// calibration instead of jumping `delta` to `delta_max`
+    pub(super) fn gentle_probe(&self) -> bool {
+        self.probing_jitter() && self.aligned() && self.config.gentle_probe
+    }
+
+    /// Initial gentle calibration right after slow start, before the first aligned slot
+    pub(super) fn wants_initial_gentle_measure(&self, slow_start: bool) -> bool {
+        self.gentle_probe() && !slow_start && !self.first_probe_done
+    }
+
+    /// Current aligned probe slot, duration, and whether a slower board peer extended the slot
+    pub(super) fn current_aligned_probe_slot(
+        &self,
+        now: Instant,
+        slow_start: bool,
+        srtt: Duration,
+    ) -> Option<(u64, Duration, bool)> {
+        if !self.gentle_probe() || !self.in_timed_probe(now, slow_start) {
+            return None;
+        }
+        let dur = if self.config.adaptive_probes {
+            self.slot_duration
+        } else {
+            self.config.probe_duration.as_secs_f64()
+        };
+        let hold_full = dur > self.wanted_duration(srtt).as_secs_f64() + 1e-3;
+        Some((self.slot(now), Duration::from_secs_f64(dur.max(0.0)), hold_full))
+    }
+
+    pub(super) fn request_drain_on_board(&self, slot: u64) {
+        self.config.board.request_drain(slot);
+    }
+
+    pub(super) fn drain_requested_on_board(&self, slot: u64) -> bool {
+        self.config.board.drain_requested(slot)
+    }
+
+    pub(super) fn finish_gentle_probe(
+        &mut self,
+        slot: Option<u64>,
+        probe_dq: Option<f64>,
+        rtt_min: Duration,
+    ) {
+        if let Some(dq) = probe_dq {
+            if !self.first_probe_done {
+                self.first_probe_done = true;
+                self.settle_halves = 1;
+                if self.est.jitter.is_none() {
+                    self.est.jitter = Some(dq.min(MAX_JITTER));
+                }
+            }
+            if slot.is_some() {
+                self.record_aligned_probe(dq, rtt_min);
+            }
+        } else if !self.first_probe_done {
+            self.first_probe_done = true;
+            self.settle_halves = 1;
+        }
+        if let Some(s) = slot {
+            self.decided_slot = Some(s);
+            if self.probing_slot == Some(s) {
+                self.probing_slot = None;
+            }
+        }
+        self.probe_dq_sum = 0.0;
+        self.probe_acks = 0;
     }
 
     pub(super) fn recovery(&self) -> f64 {
@@ -397,17 +468,6 @@ impl AutoDelta {
         self.agreeing = 0;
         self.reset_next = true;
         self.fallback_level = 0;
-    }
-
-    /// A packet that found the bottleneck idle: its RTT is within the jitter floor plus the idle
-    /// margin of `reference`
-    pub(super) fn is_idle(&self, rtt: Duration, reference: Duration) -> bool {
-        let j = self.est.jitter.unwrap_or(0.0);
-        rtt.as_secs_f64() - reference.as_secs_f64() <= j + self.config.idle_margin.as_secs_f64()
-    }
-
-    pub(super) fn drain_window(&self) -> f64 {
-        self.config.drain_window
     }
 
     pub(super) fn drain_skip(&self) -> Duration {
@@ -483,67 +543,22 @@ impl AutoDelta {
 
         if self.in_timed_probe(s.now, s.slow_start) {
             self.seg_probe = true;
-            // A probe that overlaps the first one still holds the slow-start queue; only the
-            // second half of a probe is measured
-            let duration = if self.config.adaptive_probes {
-                self.slot_duration
-            } else {
-                self.config.probe_duration.as_secs_f64()
-            };
-            if self.first_probe_done && self.phase(s.now) >= 0.5 * duration {
-                self.probe_dq_sum += dq;
-                self.probe_acks += 1;
+            if !s.managed_probe {
+                // A probe that overlaps the first one still holds the slow-start queue; only the
+                // second half of a probe is measured
+                let duration = if self.config.adaptive_probes {
+                    self.slot_duration
+                } else {
+                    self.config.probe_duration.as_secs_f64()
+                };
+                if self.first_probe_done && self.phase(s.now) >= 0.5 * duration {
+                    self.probe_dq_sum += dq;
+                    self.probe_acks += 1;
+                }
             }
-        } else if self.probe_acks > 0 {
-            // End of an aligned probe: every flow of the host was at low load, so the mean dq of
-            // its second half is the jitter floor. The first aligned probe replaces the estimate
-            // of the unaligned first probe, so that all flows hold values from the same probes.
+        } else if !s.managed_probe && self.probe_acks > 0 {
             let probe_dq = self.probe_dq_sum / self.probe_acks as f64;
-            let fresh = !self.aligned_probe_seen || self.reset_next;
-            let old = self.est.jitter;
-            let j = match (fresh, old) {
-                (false, Some(j)) => j.min(probe_dq),
-                _ => probe_dq,
-            };
-            if self.config.adaptive_probes {
-                // Stable once `stable_probes` probes in a row leave the minimum where it was
-                let (abs, rel) = self.config.stable_tolerance;
-                let tol = |x: f64| abs.as_secs_f64().max(rel * x);
-                match old {
-                    // A settled estimate whose fallback probe lands well above every probe seen
-                    // while settling (1.5 times the highest): the link got worse, and the minimum
-                    // alone could never grow back. Single probes scatter on a jittery link, so a
-                    // margin within that range would restart the estimate for nothing.
-                    Some(_)
-                        if !fresh
-                            && self.stable
-                            && probe_dq
-                                > (1.5 * self.probe_hi).max(self.probe_hi + tol(self.probe_hi)) =>
-                    {
-                        self.unsettle();
-                    }
-                    Some(old) if !fresh && old - j <= tol(old) => self.agreeing += 1,
-                    _ => self.agreeing = 0,
-                }
-                if fresh {
-                    // This probe started the new estimate
-                    self.reset_next = false;
-                    self.probe_hi = probe_dq;
-                } else if !self.reset_next {
-                    self.probe_hi = self.probe_hi.max(probe_dq);
-                }
-                let was_stable = self.stable;
-                self.stable =
-                    !self.reset_next && self.agreeing + 1 >= self.config.stable_probes.max(1);
-                if was_stable && self.stable {
-                    // A fallback probe agreed: wait twice as long for the next one
-                    self.fallback_level = (self.fallback_level + 1).min(self.max_fallback_level());
-                }
-                self.rtt_min_at_probe = Some(s.rtt_min.as_secs_f64());
-            }
-            self.est.jitter = Some(j.min(MAX_JITTER));
-            self.aligned_probe_seen = true;
-            tracing::debug!(probe_dq, jitter = j, "copa-auto aligned probe");
+            self.record_aligned_probe(probe_dq, s.rtt_min);
             self.probe_dq_sum = 0.0;
             self.probe_acks = 0;
         }
@@ -686,6 +701,47 @@ impl AutoDelta {
         );
     }
 
+    fn record_aligned_probe(&mut self, probe_dq: f64, rtt_min: Duration) {
+        let fresh = !self.aligned_probe_seen || self.reset_next;
+        let old = self.est.jitter;
+        let j = match (fresh, old) {
+            (false, Some(j)) => j.min(probe_dq),
+            _ => probe_dq,
+        };
+        if self.config.adaptive_probes {
+            let (abs, rel) = self.config.stable_tolerance;
+            let tol = |x: f64| abs.as_secs_f64().max(rel * x);
+            match old {
+                Some(_)
+                    if !fresh
+                        && self.stable
+                        && probe_dq
+                            > (1.5 * self.probe_hi).max(self.probe_hi + tol(self.probe_hi)) =>
+                {
+                    self.unsettle();
+                }
+                Some(old) if !fresh && old - j <= tol(old) => self.agreeing += 1,
+                _ => self.agreeing = 0,
+            }
+            if fresh {
+                self.reset_next = false;
+                self.probe_hi = probe_dq;
+            } else if !self.reset_next {
+                self.probe_hi = self.probe_hi.max(probe_dq);
+            }
+            let was_stable = self.stable;
+            self.stable =
+                !self.reset_next && self.agreeing + 1 >= self.config.stable_probes.max(1);
+            if was_stable && self.stable {
+                self.fallback_level = (self.fallback_level + 1).min(self.max_fallback_level());
+            }
+            self.rtt_min_at_probe = Some(rtt_min.as_secs_f64());
+        }
+        self.est.jitter = Some(j.min(MAX_JITTER));
+        self.aligned_probe_seen = true;
+        tracing::debug!(probe_dq, jitter = j, "copa-auto aligned probe");
+    }
+
     #[cfg(test)]
     pub(super) fn rounds(&self) -> u64 {
         self.rounds
@@ -718,6 +774,7 @@ mod tests {
             competitive: false,
             app_limited: false,
             excluded: false,
+            managed_probe: false,
         }
     }
 

@@ -267,7 +267,7 @@ impl CongestionAlgorithm {
                 auto.jitter_floor_ms(copa_jitter_ms)
                     .drain_enabled(copa_drain)
                     .gentle_probe(copa_gentle_probe);
-                let mut cfg = congestion::CopaConfig::default();
+                let mut cfg = congestion::CopaConfig::copa_auto();
                 cfg.adaptive(Some(auto));
                 Arc::new(cfg)
             }
@@ -276,7 +276,7 @@ impl CongestionAlgorithm {
                 auto.jitter_floor_ms(copa_jitter_ms)
                     .drain_enabled(copa_drain)
                     .gentle_probe(copa_gentle_probe);
-                let mut cfg = congestion::CopaConfig::copa_nc();
+                let mut cfg = congestion::CopaConfig::copa_auto_nc();
                 cfg.adaptive(Some(auto));
                 Arc::new(cfg)
             }

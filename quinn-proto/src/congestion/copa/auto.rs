@@ -319,6 +319,20 @@ impl AutoDelta {
         self.first_probe_done
     }
 
+    pub(super) fn delta_max(&self) -> f64 {
+        self.config.delta_max
+    }
+
+    pub(super) fn has_estimate(&self) -> bool {
+        self.est.delta.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_estimate_for_test(&mut self, delta: f64) {
+        self.first_probe_done = true;
+        self.est.delta = Some(delta);
+    }
+
     /// Whether an aligned low-load probe should gently hold the window at `drain_window * BDP`
     /// (`0.5 * BDP`) rather than jumping `delta` to `delta_max`
     pub(super) fn in_gentle_probe(&self, now: Instant, slow_start: bool) -> bool {

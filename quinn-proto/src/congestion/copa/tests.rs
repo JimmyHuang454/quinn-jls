@@ -323,17 +323,18 @@ fn clone_box_and_into_any() {
 #[test]
 fn factory_presets() {
     let presets = [
-        (CopaConfig::default(), true, false),
-        (CopaConfig::copa_nc(), false, false),
-        (CopaConfig::copa_auto(), true, true),
-        (CopaConfig::copa_auto_nc(), false, true),
+        (CopaConfig::default(), 0.5, true, false),
+        (CopaConfig::copa_nc(), 0.5, false, false),
+        (CopaConfig::copa_auto(), 0.05, true, true),
+        (CopaConfig::copa_auto_nc(), 0.05, false, true),
     ];
-    for (config, mode_switching, adaptive) in presets {
-        assert_eq!(config.delta, 0.5);
+    for (config, delta, mode_switching, adaptive) in presets {
+        assert_eq!(config.delta, delta);
         assert_eq!(config.mode_switching, mode_switching);
         assert_eq!(config.adaptive.is_some(), adaptive);
         let c = Arc::new(config).build(Instant::now(), MTU as u16);
         let c = c.into_any().downcast::<Copa>().unwrap();
+        assert_eq!(c.delta(), delta);
         assert_eq!(c.adaptive_estimate().is_some(), adaptive);
     }
 }
@@ -451,4 +452,30 @@ fn gentle_aligned_probe_holds_bdp_instead_of_collapsing() {
         pre_probe_window
     );
     assert!(gentle.pace_cap.is_some());
+}
+
+#[test]
+fn copa_auto_decouples_initial_delta_from_competitive_mode() {
+    let (mut c, mut t) = copa(CopaConfig::copa_auto());
+    let rtt = rtt_estimator(ms(50));
+    assert_eq!(c.delta(), 0.05);
+
+    // Before slow start ends and AutoDelta produces its first estimate, a steady startup queue
+    // must not falsely switch to competitive mode.
+    standing_queue(&mut c, &mut t, ms(600), &rtt);
+    assert!(!c.is_competitive());
+
+    // Once slow start ends and an adaptive estimate exists, a non-draining queue triggers
+    // competitive mode starting at delta_max (0.5) with 1/delta growing, and loss halving caps at
+    // 0.5 rather than 0.05.
+    c.slow_start = false;
+    c.auto.as_mut().unwrap().force_estimate_for_test(0.1);
+    run(&mut c, &mut t, ms(400), ms(70), &rtt);
+    assert!(c.is_competitive());
+    assert!(c.delta() < 0.5 && c.delta() > 0.1);
+    c.delta = 0.2;
+    c.on_congestion_event(t, t, false, false, MTU, 0, SpaceId::Data);
+    assert!((c.delta() - 0.4).abs() < 1e-12);
+    c.on_congestion_event(t + ms(60), t, false, false, MTU, 0, SpaceId::Data);
+    assert!((c.delta() - 0.5).abs() < 1e-12);
 }

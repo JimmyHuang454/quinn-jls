@@ -220,6 +220,12 @@ impl Copa {
         (self.window / self.current_mtu as f64).max(1.0)
     }
 
+    fn competitive_ceiling(&self) -> f64 {
+        self.auto
+            .as_ref()
+            .map_or(self.config.delta, |auto| auto.delta_max())
+    }
+
     /// Switch between the default and the competitive mode
     fn update_mode(&mut self, now: Instant, dq: Duration, rtt_min: Duration) {
         if !self.config.mode_switching {
@@ -233,8 +239,8 @@ impl Copa {
         let competitive = now.saturating_duration_since(self.last_nearly_empty) > 5 * self.srtt;
         if competitive != self.competitive {
             self.competitive = competitive;
-            // Both modes start from the configured delta
-            self.delta = self.config.delta;
+            // Both modes start from the configured delta (or delta_max for copa-auto)
+            self.delta = self.competitive_ceiling();
             self.last_delta_decrease = None;
             self.delta_before_decrease = None;
             tracing::debug!(competitive, "copa mode switch");
@@ -463,10 +469,11 @@ impl Controller for Copa {
         self.dq = dq;
         let holding = self.drain_until.is_some_and(|until| now < until)
             || (!self.competitive
-                && self
-                    .auto
-                    .as_ref()
-                    .is_some_and(|auto| auto.in_gentle_probe(now, self.slow_start)));
+                && self.auto.as_ref().is_some_and(|auto| {
+                    self.slow_start
+                        || !auto.has_estimate()
+                        || auto.in_gentle_probe(now, self.slow_start)
+                }));
         if holding {
             // Do not mistake an intentional BDP hold (probe/drain) for a competing buffer-filler
             self.last_nearly_empty = now;
@@ -613,7 +620,7 @@ impl Controller for Copa {
             return;
         }
         self.delta_before_decrease = Some(self.delta);
-        self.delta = self.config.delta.min(2.0 * self.delta);
+        self.delta = self.competitive_ceiling().min(2.0 * self.delta);
         self.last_delta_decrease = Some(now);
     }
 
@@ -677,10 +684,10 @@ impl CopaConfig {
         config
     }
 
-    /// copa-auto: delta chosen online, competitive mode on
+    /// copa-auto: delta chosen online (starts at 0.05), competitive mode on
     pub fn copa_auto() -> Self {
         let mut config = Self::default();
-        config.adaptive(Some(CopaAutoConfig::default()));
+        config.delta(0.05).adaptive(Some(CopaAutoConfig::default()));
         config
     }
 

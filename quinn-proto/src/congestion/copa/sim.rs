@@ -619,7 +619,7 @@ pub(super) fn flows(sources: Vec<Source>) -> Vec<Flow> {
 pub(super) fn copa_auto(epoch: Instant, mode_switching: bool) -> CopaConfig {
     let mut auto = super::CopaAutoConfig::default();
     auto.probe_epoch(Some(epoch));
-    let mut config = CopaConfig::default();
+    let mut config = CopaConfig::copa_auto();
     config.adaptive(Some(auto)).mode_switching(mode_switching);
     config
 }

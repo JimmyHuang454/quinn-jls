@@ -325,8 +325,8 @@ fn factory_presets() {
     let presets = [
         (CopaConfig::default(), 0.5, true, false),
         (CopaConfig::copa_nc(), 0.5, false, false),
-        (CopaConfig::copa_auto(), 0.05, true, true),
-        (CopaConfig::copa_auto_nc(), 0.05, false, true),
+        (CopaConfig::copa_auto(), 0.1, true, true),
+        (CopaConfig::copa_auto_nc(), 0.1, false, true),
     ];
     for (config, delta, mode_switching, adaptive) in presets {
         assert_eq!(config.delta, delta);
@@ -472,9 +472,15 @@ fn gentle_aligned_probe_holds_bdp_instead_of_collapsing() {
 
 #[test]
 fn copa_auto_decouples_initial_delta_from_competitive_mode() {
-    let (mut c, mut t) = copa(CopaConfig::copa_auto());
+    let epoch = Instant::now();
+    let mut t = epoch + Duration::from_secs(25);
+    let mut auto = CopaAutoConfig::default();
+    auto.probe_epoch(Some(epoch));
+    let mut cfg = CopaConfig::copa_auto();
+    cfg.adaptive(Some(auto));
+    let mut c = Copa::new(Arc::new(cfg), t, MTU as u16);
     let rtt = rtt_estimator(ms(50));
-    assert_eq!(c.delta(), 0.05);
+    assert_eq!(c.delta(), 0.1);
 
     // Before slow start ends and AutoDelta produces its first estimate, a steady startup queue
     // must not falsely switch to competitive mode.
@@ -483,7 +489,7 @@ fn copa_auto_decouples_initial_delta_from_competitive_mode() {
 
     // Once slow start ends and an adaptive estimate exists, a non-draining queue triggers
     // competitive mode starting at delta_max (0.5) with 1/delta growing, and loss halving caps at
-    // 0.5 rather than 0.05.
+    // 0.5 rather than 0.1.
     c.slow_start = false;
     c.auto.as_mut().unwrap().force_estimate_for_test(0.1);
     run(&mut c, &mut t, ms(400), ms(70), &rtt);

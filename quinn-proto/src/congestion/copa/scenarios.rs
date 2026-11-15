@@ -238,7 +238,7 @@ fn c1_copa_auto_single_flow() {
             assert!(est.dq_target > j, "{ctx}");
             let delta = est.delta.expect("delta");
             assert!((0.001..=0.5).contains(&delta), "{ctx}");
-            // With initial delta = 0.05 on `variable`, `copa-auto` targets ~0.09 so ModeSwitching's
+            // With initial delta = 0.1 on `variable`, `copa-auto` targets ~0.09 so ModeSwitching's
             // empty-queue check can fire briefly during 500 ms capacity drops (util ~0.88).
             let util_floor = if name == "variable" && mode_switching {
                 0.85
@@ -273,7 +273,7 @@ fn c2_copa_auto_multi_flow() {
             sim.set_copa(i, copa_auto(epoch, false));
         }
         let r = sim.run(secs(80), secs(30));
-        // Starting from initial delta = 0.05 takes longer to climb toward 0.5 in [30, 80s]
+        // Starting from initial delta = 0.1 takes a few half-periods to climb toward 0.5 in [30, 80s]
         assert!(r.utilization > 0.97, "n = {n}: {r:?}");
         // Early shares only. Since fast recovery restores each flow's own window after a probe,
         // a probe no longer resets the shares, and 1/delta still swings between flows during the
@@ -310,7 +310,7 @@ fn c3_copa_auto_with_background() {
         let epoch = sim.epoch();
         sim.set_copa(0, copa_auto(epoch, mode_switching));
         let r = sim.run(secs(80), secs(30));
-        // With initial delta = 0.05, short [30, 80s] window trims utilization slightly below 0.95
+        // With initial delta = 0.1, short [30, 80s] window can trim utilization slightly below 0.95
         assert!(r.utilization > 0.94, "{r:?}");
         // The background sends 2 Mbit/s on average; Copa gets nearly all of the rest
         assert!(r.throughput[0] > 9e6, "{r:?}");
@@ -392,9 +392,8 @@ fn c6_drains_keep_rtt_min_with_several_flows() {
 }
 
 /// Drains only when RTT_min is stale: a single flow empties the queue by itself and skips almost
-/// all of them; four flows sharing a lower-BDP bottleneck (6 Mbit/s, 50-pkt buffer) keep the
-/// queue busy and drain (with initial delta = 0.05, 3 Mbit/s's 25-pkt buffer overflows 80 pkts
-/// on startup and never settles `j`).
+/// all of them; four flows sharing a lower-BDP bottleneck (3.5 Mbit/s, 50-pkt buffer) keep the
+/// queue busy and drain (with small initial delta, a 25-pkt buffer can overflow on startup).
 #[test]
 fn c7_drains_are_skipped_when_rtt_min_is_fresh() {
     for (n, mbps, mostly_skipped) in [(1usize, 12.0, true), (4, 3.5, false)] {

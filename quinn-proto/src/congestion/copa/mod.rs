@@ -803,10 +803,10 @@ impl CopaConfig {
         config
     }
 
-    /// copa-auto: delta chosen online (starts at 0.05), competitive mode on
+    /// copa-auto: delta chosen online (starts at 0.1), competitive mode on
     pub fn copa_auto() -> Self {
         let mut config = Self::default();
-        config.delta(0.05).adaptive(Some(CopaAutoConfig::default()));
+        config.delta(0.1).adaptive(Some(CopaAutoConfig::default()));
         config
     }
 

@@ -212,15 +212,42 @@ impl Copa {
             return;
         }
         let rtt_max = self.rtt_max.get().unwrap_or(rtt_min);
-        // "Nearly empty": queueing delay below 10% of the RTT oscillation of the last four RTTs
-        if dq.as_secs_f64() < 0.1 * rtt_max.saturating_sub(rtt_min).as_secs_f64() {
+        let dq_s = dq.as_secs_f64();
+        let span_s = rtt_max.saturating_sub(rtt_min).as_secs_f64();
+        let nearly_empty = if let Some(auto) = &self.auto {
+            // Subtract verified jitter floor; ignore saturated MAX_JITTER (20 ms) which can reflect
+            // an active buffer-filler queue during startup calibration.
+            if let Some(j) = auto.estimate().jitter.filter(|&j| j < 0.015) {
+                let eff_dq = (dq_s - j).max(0.0);
+                let eff_span = (span_s - j).max(0.0);
+                eff_dq <= auto.idle_margin() || eff_dq < 0.1 * eff_span
+            } else {
+                dq_s < 0.1 * span_s
+            }
+        } else {
+            // "Nearly empty": queueing delay below 10% of the RTT oscillation of the last four RTTs
+            dq_s < 0.1 * span_s
+        };
+        if nearly_empty {
             self.last_nearly_empty = now;
         }
         let competitive = now.saturating_duration_since(self.last_nearly_empty) > 5 * self.srtt;
         if competitive != self.competitive {
             self.competitive = competitive;
-            // Both modes start from the configured delta (or delta_max for copa-auto)
-            self.delta = self.competitive_ceiling();
+            if competitive
+                && self.auto.is_some()
+                && self
+                    .drain
+                    .estimated_bdp(now, self.srtt, rtt_min)
+                    .is_some_and(|bdp| bdp / (self.current_mtu as f64) > 150.0)
+            {
+                // On high-BDP links, preserve a moderate entry delta (<= 0.05..0.5) so brief
+                // propagation spikes do not collapse 1/delta from ~200 all the way down to 2.
+                self.delta = self.delta.clamp(0.02, self.competitive_ceiling());
+            } else {
+                // Both modes start from the configured delta (or delta_max for copa-auto)
+                self.delta = self.competitive_ceiling();
+            }
             self.last_delta_decrease = None;
             self.delta_before_decrease = None;
             tracing::debug!(competitive, "copa mode switch");
@@ -296,8 +323,23 @@ impl Copa {
         let Some(auto) = &mut self.auto else {
             return;
         };
+        let baseline_rose = finished.plateau_converged
+            && !finished.congested
+            && finished.drain_min_rtt > rtt_min
+            && finished.drain_min_rtt.saturating_sub(rtt_min)
+                > Duration::from_millis(5).max(rtt_min.mul_f64(0.15));
+        let eff_rtt_min = if baseline_rose {
+            self.rtt_min = WindowedFilter::new(Kind::Min);
+            self.rtt_min
+                .update(now, finished.drain_min_rtt, self.config.min_rtt_window);
+            self.drain.set_trusted_min(finished.drain_min_rtt);
+            auto.on_baseline_reset();
+            finished.drain_min_rtt
+        } else {
+            rtt_min
+        };
         if finished.kind == DrainKind::MeasureJitter {
-            auto.finish_gentle_probe(finished.slot, finished.probe_dq, rtt_min);
+            auto.finish_gentle_probe(finished.slot, finished.probe_dq, eff_rtt_min);
         }
         let recovery = if finished.kind == DrainKind::RefreshRttMin || auto.recovery() > 0.0 {
             1.0
@@ -310,7 +352,12 @@ impl Copa {
                     finished.rtt_min_at_start.as_secs_f64(),
                     finished.drain_min_rtt.as_secs_f64(),
                 );
-            let target = if moved_down {
+            let target = if baseline_rose {
+                finished
+                    .bdp_est
+                    .unwrap_or(finished.saved_window)
+                    .max(finished.saved_window)
+            } else if moved_down {
                 // Queue inflation was cleared: restore toward estimated true BDP rather than
                 // re-inflating the stale pre-drain queue.
                 finished
@@ -375,6 +422,40 @@ impl Copa {
         standing: Duration,
         dq: Duration,
     ) -> bool {
+        let take_handover = {
+            let Some(auto) = &mut self.auto else {
+                return false;
+            };
+            auto.take_handover_drain()
+        };
+        if take_handover
+            && self.drain.is_normal()
+            && self
+                .drain
+                .estimated_bdp(now, self.srtt, standing)
+                .is_some_and(|bdp| self.window < 0.75 * bdp)
+        {
+            let drain_min = self.auto.as_ref().unwrap().drain_min();
+            let rate = self.pacing_rate().map_or(0.0, |r| r as f64);
+            self.drain.start(
+                DrainKind::RefreshRttMin,
+                None,
+                now,
+                self.srtt,
+                rtt_min,
+                standing,
+                dq,
+                self.window,
+                self.minimum_window(),
+                rate,
+                drain_min,
+                false,
+            );
+            if let Some(w) = self.drain.current_window(now, self.srtt, self.minimum_window()) {
+                self.window = w.clamp(self.minimum_window(), MAX_WINDOW);
+            }
+            return true;
+        }
         let Some(auto) = &self.auto else {
             return false;
         };
@@ -610,6 +691,10 @@ impl Controller for Copa {
             if let Some(auto) = &mut self.auto {
                 self.drain.observe_sample(now, sample, dq, app_limited);
                 let managed_probe = auto.gentle_probe();
+                let bdp_packets = self
+                    .drain
+                    .estimated_bdp(now, srtt, rtt_min)
+                    .map_or(0.0, |bdp| bdp / mss);
                 auto.on_ack(
                     Sample {
                         now,
@@ -622,6 +707,7 @@ impl Controller for Copa {
                         app_limited,
                         excluded,
                         managed_probe,
+                        bdp_packets,
                     },
                     self.delta,
                 );
@@ -655,6 +741,7 @@ impl Controller for Copa {
                         app_limited,
                         excluded: true,
                         managed_probe: auto.gentle_probe(),
+                        bdp_packets: 0.0,
                     },
                     self.delta,
                 );
@@ -893,6 +980,8 @@ pub struct CopaAutoConfig {
     gain_far: f64,
     far_ratio: f64,
     fair_increase: f64,
+    fair_increase_far: f64,
+    tradeoff: f64,
     probe_period: Duration,
     probe_duration: Duration,
     idle_margin: Duration,
@@ -962,6 +1051,29 @@ impl CopaAutoConfig {
     /// updates delta multiplicatively in both directions.
     pub fn fair_increase(&mut self, value: f64) -> &mut Self {
         self.fair_increase = value.max(0.0);
+        self.fair_increase_far = 3.0 * self.fair_increase;
+        self
+    }
+
+    /// Additive increase `a_far` of `1/delta` when `d_q < d_q* / far_ratio` (30).
+    pub fn fair_increase_far(&mut self, value: f64) -> &mut Self {
+        self.fair_increase_far = value.max(0.0);
+        self
+    }
+
+    /// Preference `theta` between throughput and delay, within `[0.05, 0.95]` (0.5)
+    ///
+    /// The objective is `theta ln(rho) - (1 - theta) ln(D)`: `theta` weighs the throughput and
+    /// `1 - theta` the delay. 0.5 maximizes power; lower values weigh the delay more and lower
+    /// the queueing target `d_q*` (eq:dq-target-w), higher values weigh the throughput more.
+    /// Flows sharing a bottleneck must use the same value, otherwise their targets differ and
+    /// their deltas drift to the bounds.
+    pub fn tradeoff(&mut self, theta: f64) -> &mut Self {
+        assert!(
+            (0.05..=0.95).contains(&theta),
+            "tradeoff must be within [0.05, 0.95]"
+        );
+        self.tradeoff = theta;
         self
     }
 
@@ -1100,6 +1212,8 @@ impl Default for CopaAutoConfig {
             gain_far: 0.25,
             far_ratio: 1.5,
             fair_increase: 10.0,
+            fair_increase_far: 30.0,
+            tradeoff: 0.5,
             probe_period: Duration::from_secs(20),
             probe_duration: Duration::from_secs(2),
             idle_margin: Duration::from_millis(1),

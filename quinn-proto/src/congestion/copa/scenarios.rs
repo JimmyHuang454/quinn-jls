@@ -686,3 +686,87 @@ fn probe_recovery_sweep() {
         }
     }
 }
+
+fn starlink_link(handover_plateaus: bool) -> (Link, Duration) {
+    let mut link = Link::new(375.0, ms(60));
+    link.buffer = 75 * 1024 * 1024;
+    link.random_loss = 0.0001;
+    link.rate.clear();
+    let mut x = 2025u64;
+    for i in 0..240 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let u = (x >> 11) as f64 / (1u64 << 53) as f64;
+        // ~240..440 Mbit/s around 375 Mbit/s mean
+        let rate_mbps = 260.0 + 180.0 * u;
+        link.rate.push((ms(500 * i), rate_mbps * 1e6));
+    }
+    if handover_plateaus {
+        // 15 s satellite passes: propagation base RTT ramps/steps between ~50 ms and ~95 ms
+        let mut sched = Vec::new();
+        for k in 0..24 {
+            let phase = k % 3;
+            let rtt = match phase {
+                0 => ms(55),
+                1 => ms(75),
+                _ => ms(95),
+            };
+            sched.push((secs(5 * k), rtt));
+        }
+        link.rtt_schedule = sched;
+        (link, ms(75))
+    } else {
+        // 26..60 ms base with periodic 1.5 s handover spikes every 15 s
+        let mut sched = vec![(Duration::ZERO, ms(60))];
+        for k in 1..8 {
+            sched.push((secs(15 * k), ms(120)));
+            sched.push((secs(15 * k) + ms(1500), ms(60)));
+        }
+        link.rtt_schedule = sched;
+        (link, ms(66))
+    }
+}
+
+#[test]
+#[ignore]
+fn starlink_downlink_diagnostic() {
+    for (name, handover) in [("starlink_spikes", false), ("starlink_handover", true)] {
+        for n in [1usize, 4] {
+            let (l, norm_r0) = starlink_link(handover);
+            // Reference: optimal fixed delta=0.005 (NC), copa-auto, copa-auto-NC
+            for (label, auto_on, mode_sw, fixed_delta) in [
+                ("fixed_0.005_nc", false, false, 0.005),
+                ("copa_auto", true, true, 0.1),
+                ("copa_auto_nc", true, false, 0.1),
+            ] {
+                let mut sim = Sim::new(
+                    l.clone(),
+                    flows((0..n).map(|_| Source::copa(CopaConfig::default())).collect()),
+                );
+                let epoch = sim.epoch();
+                for i in 0..n {
+                    let cfg = if auto_on {
+                        copa_auto(epoch, mode_sw)
+                    } else {
+                        copa_nc(fixed_delta)
+                    };
+                    sim.set_copa(i, cfg);
+                }
+                let r = sim.run(secs(120), secs(5));
+                let est = sim.flows[0].source.as_copa().unwrap().adaptive_estimate();
+                let rtt = norm_r0.as_secs_f64() + r.mean_queueing;
+                let norm_pwr = r.utilization / (rtt / norm_r0.as_secs_f64());
+                println!(
+                    "{name:<18} n={n} {label:<14}: util={:.3} q={:.2}ms comp={:.3} delta={:.4} pwr={:.3} jain={:.3} est={est:?}",
+                    r.utilization,
+                    r.mean_queueing * 1e3,
+                    r.competitive[0],
+                    r.copa_delta[0],
+                    norm_pwr,
+                    r.jain(0..n),
+                );
+            }
+        }
+    }
+}

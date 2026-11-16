@@ -40,6 +40,10 @@ pub(super) struct Link {
     /// A zero rate is an outage during which every packet is dropped.
     pub(super) rate: Vec<(Duration, f64)>,
     pub(super) base_rtt: Duration,
+    /// Optional piecewise-constant base RTT schedule `(offset, rtt)` for satellite handover tests
+    pub(super) rtt_schedule: Vec<(Duration, Duration)>,
+    /// Optional Bernoulli random packet loss probability (e.g. 0.0001 for Starlink downlink)
+    pub(super) random_loss: f64,
     pub(super) buffer: u64,
     /// Maximum extra one-way delay after the bottleneck, uniformly distributed
     pub(super) jitter: Duration,
@@ -59,6 +63,8 @@ impl Link {
         Self {
             rate: vec![(Duration::ZERO, mbps * 1e6)],
             base_rtt,
+            rtt_schedule: Vec::new(),
+            random_loss: 0.0,
             buffer: (2.0 * bdp).max(8.0 * MTU as f64) as u64,
             jitter: Duration::ZERO,
             jitter_hold: None,
@@ -286,6 +292,19 @@ impl Sim {
             .map_or(self.link.rate[0].1, |&(_, r)| r)
     }
 
+    fn base_rtt_at(&self, t: Instant) -> Duration {
+        if self.link.rtt_schedule.is_empty() {
+            return self.link.base_rtt;
+        }
+        let offset = t.saturating_duration_since(self.t0);
+        self.link
+            .rtt_schedule
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= offset)
+            .map_or(self.link.base_rtt, |&(_, r)| r)
+    }
+
     fn measuring(&self, t: Instant) -> bool {
         t.saturating_duration_since(self.t0) >= self.warmup
     }
@@ -449,11 +468,13 @@ impl Sim {
         let queue_delay = b.last_departure.saturating_duration_since(now);
         // A zero rate is an outage: the link drops everything
         let rate = self.rate_at(now);
-        if rate <= 0.0 || self.bottleneck.queued + size > self.link.buffer {
+        let base_rtt = self.base_rtt_at(now);
+        let rand_drop = self.link.random_loss > 0.0 && self.random() < self.link.random_loss;
+        if rate <= 0.0 || self.bottleneck.queued + size > self.link.buffer || rand_drop {
             let is_cbr = matches!(self.flows[i].source, Source::Cbr { .. });
             self.senders[i].drops += 1;
             if !is_cbr {
-                let at = now + self.link.base_rtt + queue_delay + Duration::from_millis(1);
+                let at = now + base_rtt + queue_delay + Duration::from_millis(1);
                 self.schedule(at, Event::Lost { flow: i, pn });
             }
             return;
@@ -493,7 +514,8 @@ impl Sim {
             }
             _ => self.link.jitter.mul_f64(self.random()),
         };
-        let at = departure + self.link.base_rtt / 2 + jitter;
+        let base_rtt = self.base_rtt_at(departure);
+        let at = departure + base_rtt / 2 + jitter;
         self.schedule(at, Event::Deliver { flow: i, pn });
     }
 
@@ -529,7 +551,8 @@ impl Sim {
             .take()
             .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
         s.generation += 1;
-        let at = now + self.link.base_rtt / 2;
+        let base_rtt = self.base_rtt_at(now);
+        let at = now + base_rtt / 2;
         self.schedule(
             at,
             Event::Ack {

@@ -72,6 +72,10 @@ pub struct CommonOpt {
     /// Use gentle 0.5*BDP aligned jitter probes for copa-auto instead of delta_max collapses
     #[clap(long = "copa-gentle-probe", default_value_t = true, action = clap::ArgAction::Set)]
     pub copa_gentle_probe: bool,
+    /// Preference theta of copa-auto between throughput and delay, within [0.05, 0.95]: 0.5
+    /// maximizes power, lower values favor delay, higher values favor throughput
+    #[clap(long = "copa-tradeoff", default_value_t = 0.5)]
+    pub copa_tradeoff: f64,
     /// Maximum number of bytes the peer may transmit without acknowledgement on any one stream
     /// before becoming blocked.
     ///
@@ -118,10 +122,11 @@ impl CommonOpt {
         }
 
         if let Some(cong_alg) = self.cong_alg {
-            transport.congestion_controller_factory(cong_alg.build_with_options(
+            transport.congestion_controller_factory(cong_alg.build_with_tradeoff(
                 self.copa_jitter_ms,
                 self.copa_drain,
                 self.copa_gentle_probe,
+                self.copa_tradeoff,
             ));
         }
 
@@ -254,6 +259,17 @@ impl CongestionAlgorithm {
         copa_drain: bool,
         copa_gentle_probe: bool,
     ) -> Arc<dyn ControllerFactory + Send + Sync + 'static> {
+        self.build_with_tradeoff(copa_jitter_ms, copa_drain, copa_gentle_probe, 0.5)
+    }
+
+    /// Like `build_with_options`, with the throughput/delay preference `theta` of copa-auto
+    pub fn build_with_tradeoff(
+        self,
+        copa_jitter_ms: f64,
+        copa_drain: bool,
+        copa_gentle_probe: bool,
+        copa_tradeoff: f64,
+    ) -> Arc<dyn ControllerFactory + Send + Sync + 'static> {
         match self {
             Self::Cubic => Arc::new(congestion::CubicConfig::default()),
             Self::Bbr1 => Arc::new(congestion::Bbr1Config::default()),
@@ -266,7 +282,8 @@ impl CongestionAlgorithm {
                 let mut auto = congestion::CopaAutoConfig::default();
                 auto.jitter_floor_ms(copa_jitter_ms)
                     .drain_enabled(copa_drain)
-                    .gentle_probe(copa_gentle_probe);
+                    .gentle_probe(copa_gentle_probe)
+                    .tradeoff(copa_tradeoff);
                 let mut cfg = congestion::CopaConfig::copa_auto();
                 cfg.adaptive(Some(auto));
                 Arc::new(cfg)
@@ -275,7 +292,8 @@ impl CongestionAlgorithm {
                 let mut auto = congestion::CopaAutoConfig::default();
                 auto.jitter_floor_ms(copa_jitter_ms)
                     .drain_enabled(copa_drain)
-                    .gentle_probe(copa_gentle_probe);
+                    .gentle_probe(copa_gentle_probe)
+                    .tradeoff(copa_tradeoff);
                 let mut cfg = congestion::CopaConfig::copa_auto_nc();
                 cfg.adaptive(Some(auto));
                 Arc::new(cfg)

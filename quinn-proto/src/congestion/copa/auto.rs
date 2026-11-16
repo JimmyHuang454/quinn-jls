@@ -18,7 +18,10 @@
 //!   not share a board. A fallback probe that finds a higher floor, or an `RTT_min` change,
 //!   starts a new estimate, so `j` can also grow;
 //! * the ratio `k = (d_q - j)(1 - rho) / rho` is averaged in the log domain;
-//! * the queueing target is `d_q* = j + sqrt(k * R0')`, with `R0' = RTT_min + j`;
+//! * the queueing target is `d_q* = j + sqrt(k * R0')`, with `R0' = RTT_min + j`; with a
+//!   preference `theta != 0.5` it is `d_q* = j + 2 theta R0' / (1 - 2 theta + sqrt((1 - 2 theta)^2
+//!   + 4 theta (1 - theta) R0' / k))`, which maximizes `theta ln(rho) - (1 - theta) ln(D)`
+//!   instead of the power (lower target for `theta < 0.5`, higher for `theta > 0.5`);
 //! * delta is moved towards `delta * d_q / d_q*`: multiplicatively when `d_q >= d_q*`, and by an
 //!   additive increase of `1/delta` when `d_q < d_q*`, so that the deltas of flows sharing a
 //!   bottleneck converge (AIMD on `1/delta`).
@@ -32,6 +35,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::CopaAutoConfig;
 use crate::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Queueing target `d_q*` that maximizes `theta ln(rho) - (1 - theta) ln(D)` (eq:dq-target-w)
+///
+/// With `w = (1 - theta) / theta` and `A = R0' / k`, the optimal utilization satisfies
+/// `rho / (1 - rho) = 2 A / (w - 1 + sqrt((w - 1)^2 + 4 A w))` and `d_q* = j + k rho / (1 - rho)`;
+/// multiplying by `theta` gives the form below. For `theta = 0.5` this is the power-optimal
+/// `j + sqrt(k R0')`, kept in that form so the default gives exactly the same results as before.
+pub(super) fn target_dq(jitter: f64, ratio: f64, base_rtt: f64, theta: f64) -> f64 {
+    if theta == 0.5 {
+        return jitter + (ratio * base_rtt).sqrt();
+    }
+    let a = 1.0 - 2.0 * theta;
+    jitter
+        + 2.0 * theta * base_rtt
+            / (a + (a * a + 4.0 * theta * (1.0 - theta) * base_rtt / ratio).sqrt())
+}
 
 /// Upper bound of the jitter floor, in seconds
 const MAX_JITTER: f64 = 0.02;
@@ -102,6 +121,8 @@ pub(super) struct Sample {
     pub(super) excluded: bool,
     /// When true, `DrainController` owns `MeasureJitter` sampling and calls `finish_gentle_probe`
     pub(super) managed_probe: bool,
+    /// Estimated BDP in packets (`bw_est * rtt_min / mtu`), 0 if unavailable
+    pub(super) bdp_packets: f64,
 }
 
 /// Estimates published after each half-period, for tests and logging
@@ -164,6 +185,9 @@ pub(super) struct AutoDelta {
     /// Highest probe result since the estimate was (re)started: probes above the minimum are
     /// normal on a jittery link, only one above this range means the floor rose
     probe_hi: f64,
+    /// Consecutive settled half-periods whose RTT floor shifted cleanly above `RTT_min`
+    floor_shift_streak: u32,
+    handover_drain_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -172,6 +196,7 @@ struct Accumulator {
     acks: u64,
     idle: u64,
     max_gap: f64,
+    min_rtt: Option<Duration>,
 }
 
 impl Accumulator {
@@ -180,6 +205,10 @@ impl Accumulator {
         self.acks += other.acks;
         self.idle += other.idle;
         self.max_gap = self.max_gap.max(other.max_gap);
+        self.min_rtt = match (self.min_rtt, other.min_rtt) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
     }
 }
 
@@ -236,11 +265,26 @@ impl AutoDelta {
             reset_next: false,
             rtt_min_at_probe: None,
             probe_hi: 0.0,
+            floor_shift_streak: 0,
+            handover_drain_pending: false,
         }
     }
 
     pub(super) fn estimate(&self) -> CopaAutoEstimate {
         self.est
+    }
+
+    pub(super) fn idle_margin(&self) -> f64 {
+        self.config.idle_margin.as_secs_f64()
+    }
+
+    pub(super) fn take_handover_drain(&mut self) -> bool {
+        std::mem::take(&mut self.handover_drain_pending)
+    }
+
+    pub(super) fn on_baseline_reset(&mut self) {
+        self.floor_shift_streak = 0;
+        self.handover_drain_pending = false;
     }
 
     pub(super) fn probing_jitter(&self) -> bool {
@@ -565,6 +609,7 @@ impl AutoDelta {
 
         self.round.dq_sum += dq;
         self.round.acks += 1;
+        self.round.min_rtt = Some(self.round.min_rtt.map_or(s.rtt, |m| m.min(s.rtt)));
         // The packet found the bottleneck idle: its RTT is the propagation delay plus jitter
         if let Some(j) = self.est.jitter {
             let pkt_delay = s.rtt.as_secs_f64() - s.rtt_min.as_secs_f64();
@@ -639,7 +684,24 @@ impl AutoDelta {
             let j = self.est.jitter.map_or(seg_dq, |j| j.min(seg_dq));
             self.est.jitter = Some(j.min(MAX_JITTER));
         } else if let (true, Some(j)) = (valid, self.est.jitter) {
-            self.update_delta(s, seg_dq, j, delta);
+            let floor_shift = self
+                .seg
+                .min_rtt
+                .map_or(0.0, |m| m.saturating_sub(s.rtt_min).as_secs_f64());
+            let shift_thresh = 0.005_f64.max(0.15 * s.rtt_min.as_secs_f64());
+            let shifted_baseline = self.est.delta.is_some()
+                && floor_shift > j + shift_thresh
+                && seg_dq > 2.0 * self.est.dq_target.max(0.005)
+                && seg_dq - floor_shift < floor_shift;
+            if shifted_baseline {
+                self.floor_shift_streak += 1;
+                if self.floor_shift_streak >= 2 && self.config.drain_enabled {
+                    self.handover_drain_pending = true;
+                }
+            } else {
+                self.floor_shift_streak = 0;
+                self.update_delta(s, seg_dq, j, delta);
+            }
         }
 
         self.seg = Accumulator::default();
@@ -660,9 +722,9 @@ impl AutoDelta {
         } else {
             ((1.0 - cfg.weight) * self.est.ratio.ln() + cfg.weight * k.ln()).exp()
         };
-        // eq:dq-target
+        // eq:dq-target (theta = 0.5) and eq:dq-target-w
         let base_rtt = s.rtt_min.as_secs_f64() + j;
-        let dq_target = j + (ratio * base_rtt).sqrt();
+        let dq_target = target_dq(j, ratio, base_rtt, cfg.tradeoff);
 
         // eq:delta-update. At equilibrium delta* = delta dq / dq*. Large steps far from the
         // target, small ones near it where measurement noise dominates.
@@ -679,9 +741,16 @@ impl AutoDelta {
         };
         let mut next = base * (gain * err).exp();
         if cfg.fair_increase > 0.0 && err < 0.0 {
-            // dq below the target: the same additive step of 1/delta for every flow, so that
-            // the differences between flows shrink with each multiplicative decrease
-            next = 1.0 / (1.0 / base - cfg.fair_increase * err);
+            // dq below the target: use the same additive step of 1/delta for every flow so
+            // differences shrink at equilibrium, scaling the far-below-target slope only on
+            // high-BDP links where 1/delta* is large.
+            let far_frac = ((s.bdp_packets - 150.0) / 500.0).clamp(0.0, 1.0);
+            let slope = if -err > cfg.far_ratio.ln() {
+                cfg.fair_increase + far_frac * (cfg.fair_increase_far - cfg.fair_increase).max(0.0)
+            } else {
+                cfg.fair_increase
+            };
+            next = 1.0 / (1.0 / base - slope * err);
         }
         let next = next.clamp(cfg.delta_min, cfg.delta_max);
 
@@ -775,6 +844,7 @@ mod tests {
             app_limited: false,
             excluded: false,
             managed_probe: false,
+            bdp_packets: 0.0,
         }
     }
 
@@ -827,6 +897,35 @@ mod tests {
         assert!(est.delta.is_some());
     }
 
+    /// eq:dq-target-w: the target equals the power-optimal one for theta = 0.5, satisfies the
+    /// first-order condition of theta ln(rho) - (1 - theta) ln(D), and increases with theta
+    #[test]
+    fn tradeoff_target() {
+        // Example link of the paper: k = 0.41 ms, R0' = 50.6 ms, j = 0.55 ms
+        let (j, k, r0) = (0.55e-3, 0.41e-3, 50.6e-3);
+        assert_eq!(target_dq(j, k, r0, 0.5), j + (k * r0).sqrt());
+        // The general form tends to the power-optimal target as theta -> 0.5
+        assert!((target_dq(j, k, r0, 0.5 + 1e-9) - target_dq(j, k, r0, 0.5)).abs() < 1e-9);
+        assert!((target_dq(j, k, r0, 0.25) - j - 2.50e-3).abs() < 0.01e-3);
+        assert!((target_dq(j, k, r0, 0.75) - j - 8.31e-3).abs() < 0.01e-3);
+        let mut last = 0.0;
+        for theta in [0.05, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 0.95] {
+            let target = target_dq(j, k, r0, theta);
+            assert!(target > last, "target must increase with theta");
+            last = target;
+            // First-order condition (1 - rho)^2 D = w k rho with w = (1 - theta) / theta,
+            // W = k rho / (1 - rho) and D = R0' + W
+            let w = (1.0 - theta) / theta;
+            let queue = target - j;
+            let rho = queue / (k + queue);
+            let lhs = (1.0 - rho).powi(2) * (r0 + queue);
+            assert!(
+                (lhs - w * k * rho).abs() < 1e-9 * w * k * rho,
+                "theta = {theta}"
+            );
+        }
+    }
+
     #[test]
     fn probes_use_delta_max_and_slow_start_uses_fallback() {
         let mut c = CopaAutoConfig::default();
@@ -847,6 +946,7 @@ mod tests {
             acks: 100,
             idle: 2,
             max_gap: 0.0,
+            min_rtt: None,
         };
         (a, sample(Instant::now(), ms(40), ms(0)))
     }
@@ -899,6 +999,7 @@ mod tests {
                 acks: 100,
                 idle: 2,
                 max_gap: 0.0,
+                min_rtt: None,
             };
             b.seg = a.seg;
             a.update_delta(&s, dq, 0.001, 0.5);

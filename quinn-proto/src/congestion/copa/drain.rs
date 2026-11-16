@@ -159,6 +159,7 @@ pub(super) struct DrainFinished {
     pub(super) congested: bool,
     pub(super) probe_dq: Option<f64>,
     pub(super) bdp_est: Option<f64>,
+    pub(super) plateau_converged: bool,
 }
 
 /// Manages smooth rate-based queue drains, jitter calibration holds, and recovery pacing
@@ -526,7 +527,18 @@ impl DrainController {
         rtt_min: Duration,
         d: ActiveDrain,
     ) -> DrainFinished {
-        let new_base = if d.drain_min_rtt < Duration::MAX {
+        let plateau_converged = d.flat_rounds >= 2
+            && !d.congested
+            && d.kind == DrainKind::RefreshRttMin
+            && d.slot.is_none()
+            && d.drain_min_rtt < Duration::MAX;
+        let baseline_rose = plateau_converged
+            && d.drain_min_rtt > rtt_min
+            && d.drain_min_rtt.saturating_sub(rtt_min)
+                > Duration::from_millis(5).max(rtt_min.mul_f64(0.15));
+        let new_base = if baseline_rose {
+            d.drain_min_rtt
+        } else if d.drain_min_rtt < Duration::MAX {
             rtt_min.min(d.drain_min_rtt)
         } else {
             rtt_min
@@ -571,6 +583,7 @@ impl DrainController {
             congested: d.congested,
             probe_dq,
             bdp_est,
+            plateau_converged,
         }
     }
 }

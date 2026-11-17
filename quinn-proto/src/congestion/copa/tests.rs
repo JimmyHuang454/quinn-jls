@@ -693,3 +693,33 @@ fn on_sent_expires_drain_and_recovery_timeouts() {
     c.on_sent(start + Duration::from_secs(4), MTU, 11);
     assert!(c.drain.is_normal());
 }
+
+#[test]
+fn app_idle_gap_reenters_slow_start_while_preserving_estimate() {
+    let epoch = Instant::now();
+    let t0 = epoch + Duration::from_secs(5);
+    let mut auto = CopaAutoConfig::default();
+    auto.probe_epoch(Some(epoch));
+    let mut cfg = CopaConfig::copa_auto();
+    cfg.adaptive(Some(auto));
+    let mut c = Copa::new(Arc::new(cfg), t0, MTU as u16);
+    let rtt = rtt_estimator(ms(50));
+    let mut t = ten_ms_queue(&mut c, t0, &rtt);
+    c.slow_start = false;
+    c.auto.as_mut().unwrap().force_estimate_for_test(0.04);
+    c.window = (6 * MTU) as f64;
+
+    // Saturated traffic gap does not blindly restart slow start when last ACK was not app_limited
+    ack(&mut c, t + ms(10), ms(50), &rtt);
+    t += ms(10);
+    c.on_sent(t + Duration::from_secs(1), MTU, 10);
+    assert!(!c.in_slow_start());
+
+    // After an app-limited tail and >= 4 * srtt idle pause, slow start resumes while keeping delta
+    t += Duration::from_secs(1) + ms(10);
+    c.on_ack(t, t - ms(50), MTU, 11, SpaceId::Data, true, &rtt);
+    c.on_sent(t + Duration::from_secs(1), MTU, 12);
+    assert!(c.in_slow_start());
+    assert_eq!(c.adaptive_estimate().unwrap().delta, Some(0.04));
+    assert!(c.window() >= CopaConfig::copa_auto().initial_window);
+}

@@ -19,8 +19,13 @@ on:
       send_fairness:
         description: "quinn TransportConfig::send_fairness (false = FIFO across concurrent streams like single-TCP)"
         required: true
-        default: true
+        default: false
         type: boolean
+      stream_receive_window:
+        description: "quinn --stream-receive-window (e.g. 8M avoids 1.25M flow-control interleaving on app.wk)"
+        required: false
+        default: "8M"
+        type: string
 
 concurrency:
   group: mahimahi-compare-${{ github.ref }}
@@ -75,19 +80,25 @@ jobs:
           MODE: ${{ github.event.inputs.mode }}
           SHARD: ${{ matrix.shard }}
           SEND_FAIRNESS: ${{ github.event.inputs.send_fairness }}
+          STREAM_RECEIVE_WINDOW: ${{ github.event.inputs.stream_receive_window }}
         run: |
           BULK_SECS=45
           if [ "$MODE" = "smoke" ]; then
             BULK_SECS=30
           fi
+          EXTRA_ARGS=()
+          if [ -n "$STREAM_RECEIVE_WINDOW" ]; then
+            EXTRA_ARGS+=(--stream-receive-window "$STREAM_RECEIVE_WINDOW")
+          fi
           python3 scripts/run_mahimahi_suite.py \
             --stack quinn \
             --shard "$SHARD" \
-            --ccs "copa-auto,copa-auto-nc,copa,bbr1,cubic" \
+            --ccs "copa-auto,copa-auto-nc,copa-auto-t70,copa,bbr1,cubic" \
             --queues "150000,2000000" \
             --workloads "bulk,app" \
             --bulk-secs "$BULK_SECS" \
             --send-fairness "$SEND_FAIRNESS" \
+            "${EXTRA_ARGS[@]}" \
             --parallel 4 \
             --bin ./target/release/quinn-perf \
             --trace-dir /tmp/traces \

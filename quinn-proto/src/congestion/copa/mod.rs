@@ -99,6 +99,8 @@ pub struct Copa {
     drain: DrainController,
     /// Latest timestamp observed via `on_sent`, `on_ack`, or `on_congestion_event`
     last_time: Instant,
+    /// Whether the last received ACK was marked `app_limited`
+    last_ack_app_limited: bool,
     /// Saved window/RTT_min for legacy `delta_max` aligned probes (`gentle_probe == false`)
     legacy_probe: Option<LegacyProbeSaved>,
     /// Drains started and skipped (RTT_min was fresh)
@@ -145,6 +147,7 @@ impl Copa {
             auto,
             drain: DrainController::new(),
             last_time: now,
+            last_ack_app_limited: false,
             legacy_probe: None,
             #[cfg(test)]
             drains: (0, 0),
@@ -222,11 +225,11 @@ impl Copa {
                 let eff_span = (span_s - j).max(0.0);
                 eff_dq <= auto.idle_margin() || eff_dq < 0.1 * eff_span
             } else {
-                dq_s < 0.1 * span_s
+                dq.is_zero() || dq_s < 0.1 * span_s
             }
         } else {
             // "Nearly empty": queueing delay below 10% of the RTT oscillation of the last four RTTs
-            dq_s < 0.1 * span_s
+            dq.is_zero() || dq_s < 0.1 * span_s
         };
         if nearly_empty {
             self.last_nearly_empty = now;
@@ -620,10 +623,29 @@ impl Copa {
 
 impl Controller for Copa {
     fn on_sent(&mut self, now: Instant, _bytes: u64, _last_packet_number: u64) {
+        let prev_time = self.last_time;
         self.last_time = self.last_time.max(now);
         if let Some(finished) = self.drain.poll_expiry(now, self.srtt, self.rtt_min.get()) {
             let rtt_min = self.rtt_min.get().unwrap_or(finished.rtt_min_at_start);
             self.apply_drain_finished(now, finished, rtt_min);
+        }
+        let idle_thresh = self.srtt.mul_f64(4.0).max(Duration::from_millis(300));
+        if self.auto.as_ref().is_some_and(|a| a.first_probe_done())
+            && self.drain.is_normal()
+            && !self.slow_start
+            && !self.competitive
+            && self.last_ack_app_limited
+            && now.saturating_duration_since(prev_time) >= idle_thresh
+        {
+            // After an application-idle gap, re-enter ACK-clocked slow start (keeping learned
+            // delta/jitter estimates) so cwnd quickly rediscovers post-idle capacity.
+            self.slow_start = true;
+            self.window = self
+                .window
+                .max(self.config.initial_window as f64)
+                .min(MAX_WINDOW);
+            self.reset_velocity();
+            self.last_nearly_empty = now;
         }
     }
 
@@ -638,6 +660,7 @@ impl Controller for Copa {
         rtt: &RttEstimator,
     ) {
         self.last_time = self.last_time.max(now);
+        self.last_ack_app_limited = app_limited;
         let sample = now.saturating_duration_since(sent);
         // The connection updates its RTT estimator after the congestion controller has seen the
         // acknowledged packets, so the very first samples fall back to the initial RTT

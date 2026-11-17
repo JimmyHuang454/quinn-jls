@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import queue
 import random
+import re
 import subprocess
 import threading
 import time
@@ -167,6 +168,16 @@ def run_mm_cmd(
     return res
 
 
+def parse_cc_flags(cc: str) -> tuple[str, list[str]]:
+    """Map suite label like `copa-auto-t70` to (`copa-auto`, [`--copa-tradeoff`, `0.70`])."""
+    m = re.match(r"^(copa-auto(?:-nc)?)-t(\d+)$", cc)
+    if m:
+        alg = m.group(1)
+        theta = int(m.group(2)) / 100.0
+        return alg, ["--copa-tradeoff", f"{theta:.2f}"]
+    return cc, []
+
+
 def run_quinn_job(
     slot: int,
     bin_path: Path,
@@ -180,36 +191,48 @@ def run_quinn_job(
     out_dir: Path,
     bulk_secs: int,
     send_fairness: str,
+    stream_receive_window: str | None,
 ) -> tuple[str, int]:
     port = 4433 + slot
     stem = f"quinn__{workload_kind}__{trace_name}__q{q_bytes}__{cc}"
     log_path = out_dir / f"{stem}.downlink.log"
     sum_path = out_dir / f"{stem}.summary.json"
     srv_log = out_dir / f"{stem}.server.log"
+    alg, extra_cc_flags = parse_cc_flags(cc)
+
+    srv_cmd = [
+        str(bin_path),
+        "server",
+        "--listen",
+        f"0.0.0.0:{port}",
+        "--congestion",
+        alg,
+        *extra_cc_flags,
+        "--initial-mtu",
+        "1450",
+        "--send-fairness",
+        send_fairness,
+    ]
+    if stream_receive_window:
+        srv_cmd.extend(["--stream-receive-window", stream_receive_window])
 
     srv = subprocess.Popen(
-        [
-            str(bin_path),
-            "server",
-            "--listen",
-            f"0.0.0.0:{port}",
-            "--congestion",
-            cc,
-            "--initial-mtu",
-            "1450",
-            "--send-fairness",
-            send_fairness,
-        ],
+        srv_cmd,
         stdout=srv_log.open("w"),
         stderr=subprocess.STDOUT,
     )
     try:
         time.sleep(0.8)
+        extra_str = " ".join(extra_cc_flags)
+        srw_str = f"--stream-receive-window {stream_receive_window}" if stream_receive_window else ""
+        common_cli = (
+            f'--ip "${{MAHIMAHI_BASE}}" --congestion "{alg}" {extra_str} --initial-mtu 1450 '
+            f'--send-fairness {send_fairness} {srw_str}'
+        )
         if workload_kind == "bulk":
             client_cmd = (
                 f'timeout {bulk_secs + 60} "{bin_path}" client "${{MAHIMAHI_BASE}}:{port}" '
-                f'--ip "${{MAHIMAHI_BASE}}" --congestion "{cc}" --initial-mtu 1450 '
-                f'--send-fairness {send_fairness} '
+                f'{common_cli} '
                 f'--bi-requests 1 --download-size 500M --duration {bulk_secs} '
                 f'--summary-json "{sum_path}" --json "{out_dir / (stem + ".iperf.json")}"'
             )
@@ -217,8 +240,7 @@ def run_quinn_job(
             rct_path = out_dir / f"{stem}.rct.csv"
             client_cmd = (
                 f'timeout 220 "{bin_path}" client "${{MAHIMAHI_BASE}}:{port}" '
-                f'--ip "${{MAHIMAHI_BASE}}" --congestion "{cc}" --initial-mtu 1450 '
-                f'--send-fairness {send_fairness} '
+                f'{common_cli} '
                 f'--workload "{workload_path}" --duration 200 '
                 f'--rct-csv "{rct_path}" --summary-json "{sum_path}"'
             )
@@ -314,6 +336,7 @@ def main() -> None:
     parser.add_argument("--workloads", default="bulk,app", help="Comma-separated workloads (bulk,app)")
     parser.add_argument("--bulk-secs", type=int, default=45)
     parser.add_argument("--send-fairness", choices=["true", "false"], default="true")
+    parser.add_argument("--stream-receive-window", default=None, help="Optional quinn --stream-receive-window (e.g. 8M)")
     parser.add_argument("--parallel", type=int, default=4)
     parser.add_argument("--bin", required=True, type=Path, help="Path to quinn-perf or Mortise client binary")
     parser.add_argument("--trace-dir", required=True, type=Path)
@@ -363,6 +386,7 @@ def main() -> None:
                     args.out_dir,
                     args.bulk_secs,
                     args.send_fairness,
+                    args.stream_receive_window or None,
                 )
             return run_mortise_job(args.bin, cc, t, up_tr, down_tr, q, wk, wk_path, args.out_dir, args.bulk_secs)
         finally:

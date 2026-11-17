@@ -155,10 +155,14 @@ pub(super) struct AutoDelta {
     last_ack: Option<Instant>,
     round_start: Option<Instant>,
     round: Accumulator,
+    round_app_limited: bool,
     rounds: u64,
     seg: Accumulator,
+    seg_rounds: u32,
     seg_probe: bool,
     seg_app_limited: bool,
+    in_app_idle: bool,
+    post_idle: bool,
     /// Half-periods still to discard after a probe, while Copa leaves the probe's equilibrium
     settle_halves: u32,
 
@@ -245,10 +249,14 @@ impl AutoDelta {
             last_ack: None,
             round_start: None,
             round: Accumulator::default(),
+            round_app_limited: false,
             rounds: 0,
             seg: Accumulator::default(),
+            seg_rounds: 0,
             seg_probe: false,
             seg_app_limited: false,
+            in_app_idle: false,
+            post_idle: false,
             settle_halves: 0,
             first_probe_done: fixed_jitter.is_some(),
             aligned_probe_seen: fixed_jitter.is_some(),
@@ -370,7 +378,6 @@ impl AutoDelta {
         self.first_probe_done && self.in_timed_probe(now, slow_start)
     }
 
-    #[cfg(test)]
     pub(super) fn first_probe_done(&self) -> bool {
         self.first_probe_done
     }
@@ -436,7 +443,6 @@ impl AutoDelta {
         if let Some(dq) = probe_dq {
             if !self.first_probe_done {
                 self.first_probe_done = true;
-                self.settle_halves = 1;
                 if self.est.jitter.is_none() {
                     self.est.jitter = Some(dq.min(MAX_JITTER));
                 }
@@ -446,8 +452,16 @@ impl AutoDelta {
             }
         } else if !self.first_probe_done {
             self.first_probe_done = true;
-            self.settle_halves = 1;
         }
+        // Gentle jitter calibration already restores cwnd; discard partial probe-era samples and
+        // start the next half-period cleanly without skipping an extra 8-RTT half-period.
+        let half_rounds = u64::from(self.config.half_rounds.max(1));
+        self.rounds -= self.rounds % half_rounds;
+        self.seg = Accumulator::default();
+        self.seg_rounds = 0;
+        self.seg_probe = false;
+        self.seg_app_limited = false;
+        self.post_idle = false;
         if let Some(s) = slot {
             self.decided_slot = Some(s);
             if self.probing_slot == Some(s) {
@@ -535,12 +549,19 @@ impl AutoDelta {
     pub(super) fn on_ack(&mut self, s: Sample, delta: f64) {
         let dq = s.dq.as_secs_f64();
         let round_start = *self.round_start.get_or_insert(s.now);
-        if let Some(last) = self.last_ack {
-            let gap = s.now.saturating_duration_since(last).as_secs_f64();
-            self.round.max_gap = self.round.max_gap.max(gap);
+        if s.app_limited {
+            self.in_app_idle = true;
+            self.round_app_limited = true;
+        } else {
+            if !self.in_app_idle
+                && let Some(last) = self.last_ack
+            {
+                let gap = s.now.saturating_duration_since(last).as_secs_f64();
+                self.round.max_gap = self.round.max_gap.max(gap);
+            }
+            self.in_app_idle = false;
         }
         self.last_ack = Some(s.now);
-        self.seg_app_limited |= s.app_limited;
         self.seg_probe |= s.excluded;
 
         if self.config.adaptive_probes && self.aligned() {
@@ -627,6 +648,35 @@ impl AutoDelta {
         }
         self.round_start = Some(s.now);
         self.round = Accumulator::default();
+        self.round_app_limited = false;
+    }
+
+    fn apply_segment_update(&mut self, s: &Sample, seg_dq: f64, j: f64, delta: f64) {
+        let floor_shift = self
+            .seg
+            .min_rtt
+            .map_or(0.0, |m| m.saturating_sub(s.rtt_min).as_secs_f64());
+        let shift_thresh = 0.005_f64.max(0.15 * s.rtt_min.as_secs_f64());
+        let shifted_baseline = self.est.delta.is_some()
+            && floor_shift > j + shift_thresh
+            && seg_dq > 2.0 * self.est.dq_target.max(0.005)
+            && seg_dq - floor_shift < floor_shift;
+        if shifted_baseline {
+            self.floor_shift_streak += 1;
+            if self.floor_shift_streak >= 2 && self.config.drain_enabled {
+                self.handover_drain_pending = true;
+            }
+        } else {
+            self.floor_shift_streak = 0;
+            self.update_delta(s, seg_dq, j, delta);
+        }
+    }
+
+    fn reset_segment(&mut self) {
+        self.seg = Accumulator::default();
+        self.seg_rounds = 0;
+        self.seg_probe = false;
+        self.seg_app_limited = false;
     }
 
     fn end_round(&mut self, s: &Sample, delta: f64) {
@@ -636,9 +686,39 @@ impl AutoDelta {
         let probe = self.in_round_probe();
         // The first half-period of a low-load probe only lets Copa settle
         let settling = probe && self.half_index().is_multiple_of(probe_every);
-        if !settling && self.rounds % half_rounds >= u64::from(cfg.settle_rounds) {
+        let srtt = s.srtt.as_secs_f64();
+
+        if self.round_app_limited {
+            // An application pause/burst tail does not poison already-collected saturated rounds:
+            // if a short burst already accumulated >= 3 clean rounds, flush an update now.
+            if !settling
+                && self.settle_halves == 0
+                && !probe
+                && !s.competitive
+                && !self.seg_probe
+                && self.seg_rounds >= 3
+                && self.seg.acks >= 6
+                && self.seg.max_gap < srtt.max(0.05)
+                && let Some(j) = self.est.jitter
+            {
+                let seg_dq = self.seg.dq_sum / self.seg.acks as f64;
+                self.apply_segment_update(s, seg_dq, j, delta);
+            }
+            self.reset_segment();
+            self.rounds -= self.rounds % half_rounds;
+            self.post_idle = true;
+            return;
+        }
+
+        let settle_target = if self.post_idle {
+            u64::from(cfg.settle_rounds.min(1))
+        } else {
+            u64::from(cfg.settle_rounds)
+        };
+        if !settling && self.rounds % half_rounds >= settle_target {
             let round = self.round;
             self.seg.add(&round);
+            self.seg_rounds += 1;
         }
         self.rounds += 1;
         if !self.rounds.is_multiple_of(half_rounds) || settling {
@@ -647,7 +727,6 @@ impl AutoDelta {
 
         // A half-period with an outage (handover, radio link failure), in the competitive mode
         // or limited by the application is not an equilibrium point
-        let srtt = s.srtt.as_secs_f64();
         let settling_after_probe = self.settle_halves > 0 && !probe;
         if settling_after_probe {
             self.settle_halves -= 1;
@@ -684,29 +763,11 @@ impl AutoDelta {
             let j = self.est.jitter.map_or(seg_dq, |j| j.min(seg_dq));
             self.est.jitter = Some(j.min(MAX_JITTER));
         } else if let (true, Some(j)) = (valid, self.est.jitter) {
-            let floor_shift = self
-                .seg
-                .min_rtt
-                .map_or(0.0, |m| m.saturating_sub(s.rtt_min).as_secs_f64());
-            let shift_thresh = 0.005_f64.max(0.15 * s.rtt_min.as_secs_f64());
-            let shifted_baseline = self.est.delta.is_some()
-                && floor_shift > j + shift_thresh
-                && seg_dq > 2.0 * self.est.dq_target.max(0.005)
-                && seg_dq - floor_shift < floor_shift;
-            if shifted_baseline {
-                self.floor_shift_streak += 1;
-                if self.floor_shift_streak >= 2 && self.config.drain_enabled {
-                    self.handover_drain_pending = true;
-                }
-            } else {
-                self.floor_shift_streak = 0;
-                self.update_delta(s, seg_dq, j, delta);
-            }
+            self.apply_segment_update(s, seg_dq, j, delta);
         }
 
-        self.seg = Accumulator::default();
-        self.seg_probe = false;
-        self.seg_app_limited = false;
+        self.reset_segment();
+        self.post_idle = false;
     }
 
     fn update_delta(&mut self, s: &Sample, seg_dq: f64, j: f64, delta: f64) {
@@ -744,7 +805,7 @@ impl AutoDelta {
             // dq below the target: use the same additive step of 1/delta for every flow so
             // differences shrink at equilibrium, scaling the far-below-target slope only on
             // high-BDP links where 1/delta* is large.
-            let far_frac = ((s.bdp_packets - 150.0) / 500.0).clamp(0.0, 1.0);
+            let far_frac = ((s.bdp_packets - 30.0) / 170.0).clamp(0.0, 1.0);
             let slope = if -err > cfg.far_ratio.ln() {
                 cfg.fair_increase + far_frac * (cfg.fair_increase_far - cfg.fair_increase).max(0.0)
             } else {
@@ -1363,5 +1424,31 @@ mod tests {
             assert!((a.estimate().base_rtt - (0.070 + expected_j)).abs() < 1e-9);
             assert!(a.estimate().delta.is_some());
         }
+    }
+
+    #[test]
+    fn intermittent_bursts_update_delta_across_idle_gaps() {
+        let mut a = AutoDelta::new(round_based(), Instant::now());
+        let mut t = Instant::now();
+        // Establish 2 ms jitter floor over the initial two half-periods (16 rounds of 10 ms)
+        feed(&mut a, &mut t, ms(161), ms(2), |_| false, |_| {});
+        assert!(a.estimate().jitter.is_some());
+        assert_eq!(a.estimate().delta, None);
+
+        // Short burst of 6 saturated rounds (3 settle + 3 active) followed by an app_limited tail:
+        // instead of discarding the incomplete 8-round half-period, the 3 active rounds flush an update.
+        feed(&mut a, &mut t, ms(62), ms(8), |i| i % 2 == 0, |_| {});
+        feed(&mut a, &mut t, ms(12), ms(2), |_| true, |s| s.app_limited = true);
+        let first_delta = a
+            .estimate()
+            .delta
+            .expect("3 active rounds before app_limited tail should flush delta");
+
+        // A long application-idle gap does not poison max_gap for the next short burst (4 active rounds).
+        t += Duration::from_secs(2);
+        feed(&mut a, &mut t, ms(52), ms(12), |_| false, |_| {});
+        feed(&mut a, &mut t, ms(12), ms(2), |_| true, |s| s.app_limited = true);
+        let second_delta = a.estimate().delta.unwrap();
+        assert_ne!(second_delta, first_delta);
     }
 }

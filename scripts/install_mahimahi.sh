@@ -14,6 +14,19 @@ if [[ "$variant" == leo ]]; then
     cd "$source_dir/leoreplayer/replayer"
     # The upstream replayer was built on Ubuntu 22.04. Keep warnings visible on newer compilers.
     sed -i 's/ -Werror"/"/' configure.ac
+    # Preserve the outer host address for clients in nested shells. The LeoCC example hardcodes
+    # a server IP, whereas the suite resolves the server through the standard MAHIMAHI_BASE API.
+    python3 - <<'PY'
+from pathlib import Path
+
+path = Path("src/packet/packetshell.cc")
+source = path.read_text()
+before = 'ingress_addr().ip().c_str(),\n                                          true ) );'
+after = 'egress_addr().ip().c_str(),\n                                          false ) );'
+if source.count(before) != 1:
+    raise SystemExit("Unexpected LeoReplayer MAHIMAHI_BASE implementation")
+path.write_text(source.replace(before, after))
+PY
     ./autogen.sh
     ./configure
     for directory in util packet graphing; do

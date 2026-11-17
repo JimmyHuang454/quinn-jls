@@ -273,6 +273,13 @@ def record_failure(path: Path, result: subprocess.CompletedProcess[str]) -> None
         print(f"::error::{path.stem} (exit {result.returncode}): required output missing or empty", flush=True)
 
 
+def has_deliveries(path: Path) -> bool:
+    if not path.exists():
+        return False
+    with path.open(encoding="utf-8") as log:
+        return any(line.split(maxsplit=2)[1:2] == ["-"] for line in log if not line.startswith("#"))
+
+
 def parse_cc_flags(cc: str) -> tuple[str, list[str]]:
     """Map suite label like `copa-auto-theta0.98` or `copa-auto-nc-t70` to CLI flags."""
     m = re.match(r"^(copa-auto(?:-nc)?)-theta([0-9]*\.?[0-9]+)$", cc)
@@ -364,7 +371,7 @@ def run_quinn_job(
             )
 
         res = run_mm_cmd(replay_command(replay, q_bytes, log_path, client_cmd), sum_path, log_path)
-        if res.returncode != 0 or not sum_path.exists() or not log_path.exists():
+        if res.returncode != 0 or not sum_path.exists() or not has_deliveries(log_path):
             record_failure(out_dir / f"{stem}.err.log", res)
             return stem, res.returncode or 1
         return stem, res.returncode
@@ -407,7 +414,8 @@ def run_mortise_job(
     expected = log_path if workload_kind == "bulk" else rct_path
     allow_timeout = workload_kind == "bulk"
     res = run_mm_cmd(replay_command(replay, q_bytes, log_path, client_cmd), expected, log_path, allow_timeout=allow_timeout)
-    ok = (res.returncode == 0 or (allow_timeout and res.returncode in (124, 130))) and expected.exists()
+    ok_code = res.returncode == 0 or (allow_timeout and res.returncode in (124, 130))
+    ok = ok_code and expected.exists() and has_deliveries(log_path)
     if not ok:
         record_failure(out_dir / f"{stem}.err.log", res)
         return stem, res.returncode or 1

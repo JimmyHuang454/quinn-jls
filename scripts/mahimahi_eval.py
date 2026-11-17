@@ -335,6 +335,7 @@ def main() -> None:
         "# Mahimahi Comparison Summary (`quinn-jls` vs `BobAnkh/Mortise`)",
         "",
         f"Bulk metrics skip the first `{args.bulk_warmup_s:.1f}s` warmup window.",
+        "- Note: `copa-auto-nc-theta*` runs **Copa default mode only (`默认模式`, `mode_switching=false`)** with `--copa-tradeoff=<theta>`; `copa-auto-theta*` enables competitive mode (`mode_switching=true`).",
         "",
         "## 1. Bulk Saturated Flows (Kleinrock Power & Delay-Utilization Tradeoff)",
         "",

@@ -72,7 +72,7 @@ pub struct CommonOpt {
     /// Use gentle 0.5*BDP aligned jitter probes for copa-auto instead of delta_max collapses
     #[clap(long = "copa-gentle-probe", default_value_t = true, action = clap::ArgAction::Set)]
     pub copa_gentle_probe: bool,
-    /// Preference theta of copa-auto between throughput and delay, within [0.05, 0.95]: 0.5
+    /// Preference theta of copa-auto between throughput and delay, within [0.01, 0.99]: 0.5
     /// maximizes power, lower values favor delay, higher values favor throughput
     #[clap(long = "copa-tradeoff", default_value_t = 0.5)]
     pub copa_tradeoff: f64,
@@ -339,6 +339,8 @@ mod tests {
             "10",
             "--copa-drain=false",
             "--copa-gentle-probe=false",
+            "--copa-tradeoff",
+            "0.98",
             "--send-fairness",
             "false",
         ])
@@ -346,6 +348,7 @@ mod tests {
         assert_eq!(opt.copa_jitter_ms, 10.0);
         assert!(!opt.copa_drain);
         assert!(!opt.copa_gentle_probe);
+        assert_eq!(opt.copa_tradeoff, 0.98);
         assert!(!opt.send_fairness);
         opt.build_transport_config(
             #[cfg(feature = "qlog")]

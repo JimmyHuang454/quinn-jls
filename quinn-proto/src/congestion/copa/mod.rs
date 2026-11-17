@@ -1084,7 +1084,7 @@ impl CopaAutoConfig {
         self
     }
 
-    /// Preference `theta` between throughput and delay, within `[0.05, 0.95]` (0.5)
+    /// Preference `theta` between throughput and delay, within `[0.01, 0.99]` (0.5)
     ///
     /// The objective is `theta ln(rho) - (1 - theta) ln(D)`: `theta` weighs the throughput and
     /// `1 - theta` the delay. 0.5 maximizes power; lower values weigh the delay more and lower
@@ -1093,8 +1093,8 @@ impl CopaAutoConfig {
     /// their deltas drift to the bounds.
     pub fn tradeoff(&mut self, theta: f64) -> &mut Self {
         assert!(
-            (0.05..=0.95).contains(&theta),
-            "tradeoff must be within [0.05, 0.95]"
+            (0.01..=0.99).contains(&theta),
+            "tradeoff must be within [0.01, 0.99]"
         );
         self.tradeoff = theta;
         self

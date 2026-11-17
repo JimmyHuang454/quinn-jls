@@ -169,11 +169,20 @@ def run_mm_cmd(
 
 
 def parse_cc_flags(cc: str) -> tuple[str, list[str]]:
-    """Map suite label like `copa-auto-t70` to (`copa-auto`, [`--copa-tradeoff`, `0.70`])."""
+    """Map suite label like `copa-auto-theta0.98` or `copa-auto-nc-t70` to CLI flags."""
+    m = re.match(r"^(copa-auto(?:-nc)?)-theta([0-9]*\.?[0-9]+)$", cc)
+    if m:
+        alg = m.group(1)
+        theta = float(m.group(2))
+        if not (0.01 <= theta <= 0.99):
+            raise ValueError(f"theta out of [0.01, 0.99] in {cc!r}")
+        return alg, ["--copa-tradeoff", f"{theta:g}"]
     m = re.match(r"^(copa-auto(?:-nc)?)-t(\d+)$", cc)
     if m:
         alg = m.group(1)
         theta = int(m.group(2)) / 100.0
+        if not (0.01 <= theta <= 0.99):
+            raise ValueError(f"theta out of [0.01, 0.99] in {cc!r}")
         return alg, ["--copa-tradeoff", f"{theta:.2f}"]
     return cc, []
 

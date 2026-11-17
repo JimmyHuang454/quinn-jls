@@ -970,7 +970,7 @@ mod tests {
         assert!((target_dq(j, k, r0, 0.25) - j - 2.50e-3).abs() < 0.01e-3);
         assert!((target_dq(j, k, r0, 0.75) - j - 8.31e-3).abs() < 0.01e-3);
         let mut last = 0.0;
-        for theta in [0.05, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 0.95] {
+        for theta in [0.01, 0.05, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 0.95, 0.98, 0.99] {
             let target = target_dq(j, k, r0, theta);
             assert!(target > last, "target must increase with theta");
             last = target;

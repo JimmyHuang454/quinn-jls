@@ -11,6 +11,11 @@ on:
         options:
           - smoke
           - full
+      theta:
+        description: "Aggressive theta in [0.01, 0.99] for copa-auto-theta and copa-auto-nc-theta (默认模式/仅default mode, no competitive switching)"
+        required: true
+        default: "0.98"
+        type: string
       run_mortise:
         description: "Also build and run official BobAnkh/Mortise in parallel"
         required: true
@@ -78,6 +83,7 @@ jobs:
       - name: Run quinn-perf Mahimahi suite (${{ matrix.shard }})
         env:
           MODE: ${{ github.event.inputs.mode }}
+          THETA: ${{ github.event.inputs.theta }}
           SHARD: ${{ matrix.shard }}
           SEND_FAIRNESS: ${{ github.event.inputs.send_fairness }}
           STREAM_RECEIVE_WINDOW: ${{ github.event.inputs.stream_receive_window }}
@@ -93,7 +99,7 @@ jobs:
           python3 scripts/run_mahimahi_suite.py \
             --stack quinn \
             --shard "$SHARD" \
-            --ccs "copa-auto,copa-auto-nc,copa-auto-t70,copa,bbr1,cubic" \
+            --ccs "copa-auto,copa-auto-nc,copa-auto-theta${THETA},copa-auto-nc-theta${THETA},copa,bbr1,cubic" \
             --queues "150000,2000000" \
             --workloads "bulk,app" \
             --bulk-secs "$BULK_SECS" \

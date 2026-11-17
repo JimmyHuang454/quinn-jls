@@ -16,6 +16,11 @@ on:
         required: true
         default: true
         type: boolean
+      send_fairness:
+        description: "quinn TransportConfig::send_fairness (false = FIFO across concurrent streams like single-TCP)"
+        required: true
+        default: true
+        type: boolean
 
 concurrency:
   group: mahimahi-compare-${{ github.ref }}
@@ -69,6 +74,7 @@ jobs:
         env:
           MODE: ${{ github.event.inputs.mode }}
           SHARD: ${{ matrix.shard }}
+          SEND_FAIRNESS: ${{ github.event.inputs.send_fairness }}
         run: |
           BULK_SECS=45
           if [ "$MODE" = "smoke" ]; then
@@ -81,6 +87,7 @@ jobs:
             --queues "150000,2000000" \
             --workloads "bulk,app" \
             --bulk-secs "$BULK_SECS" \
+            --send-fairness "$SEND_FAIRNESS" \
             --parallel 4 \
             --bin ./target/release/quinn-perf \
             --trace-dir /tmp/traces \

@@ -179,6 +179,7 @@ def run_quinn_job(
     workload_path: Path,
     out_dir: Path,
     bulk_secs: int,
+    send_fairness: str,
 ) -> tuple[str, int]:
     port = 4433 + slot
     stem = f"quinn__{workload_kind}__{trace_name}__q{q_bytes}__{cc}"
@@ -187,7 +188,18 @@ def run_quinn_job(
     srv_log = out_dir / f"{stem}.server.log"
 
     srv = subprocess.Popen(
-        [str(bin_path), "server", "--listen", f"0.0.0.0:{port}", "--congestion", cc, "--initial-mtu", "1450"],
+        [
+            str(bin_path),
+            "server",
+            "--listen",
+            f"0.0.0.0:{port}",
+            "--congestion",
+            cc,
+            "--initial-mtu",
+            "1450",
+            "--send-fairness",
+            send_fairness,
+        ],
         stdout=srv_log.open("w"),
         stderr=subprocess.STDOUT,
     )
@@ -197,6 +209,7 @@ def run_quinn_job(
             client_cmd = (
                 f'timeout {bulk_secs + 60} "{bin_path}" client "${{MAHIMAHI_BASE}}:{port}" '
                 f'--ip "${{MAHIMAHI_BASE}}" --congestion "{cc}" --initial-mtu 1450 '
+                f'--send-fairness {send_fairness} '
                 f'--bi-requests 1 --download-size 500M --duration {bulk_secs} '
                 f'--summary-json "{sum_path}" --json "{out_dir / (stem + ".iperf.json")}"'
             )
@@ -205,6 +218,7 @@ def run_quinn_job(
             client_cmd = (
                 f'timeout 220 "{bin_path}" client "${{MAHIMAHI_BASE}}:{port}" '
                 f'--ip "${{MAHIMAHI_BASE}}" --congestion "{cc}" --initial-mtu 1450 '
+                f'--send-fairness {send_fairness} '
                 f'--workload "{workload_path}" --duration 200 '
                 f'--rct-csv "{rct_path}" --summary-json "{sum_path}"'
             )
@@ -299,6 +313,7 @@ def main() -> None:
     parser.add_argument("--queues", default="150000,2000000", help="Comma-separated queue sizes in bytes")
     parser.add_argument("--workloads", default="bulk,app", help="Comma-separated workloads (bulk,app)")
     parser.add_argument("--bulk-secs", type=int, default=45)
+    parser.add_argument("--send-fairness", choices=["true", "false"], default="true")
     parser.add_argument("--parallel", type=int, default=4)
     parser.add_argument("--bin", required=True, type=Path, help="Path to quinn-perf or Mortise client binary")
     parser.add_argument("--trace-dir", required=True, type=Path)
@@ -335,7 +350,20 @@ def main() -> None:
         slot = slot_pool.get()
         try:
             if args.stack == "quinn":
-                return run_quinn_job(slot, args.bin, cc, t, up_tr, down_tr, q, wk, wk_path, args.out_dir, args.bulk_secs)
+                return run_quinn_job(
+                    slot,
+                    args.bin,
+                    cc,
+                    t,
+                    up_tr,
+                    down_tr,
+                    q,
+                    wk,
+                    wk_path,
+                    args.out_dir,
+                    args.bulk_secs,
+                    args.send_fairness,
+                )
             return run_mortise_job(args.bin, cc, t, up_tr, down_tr, q, wk, wk_path, args.out_dir, args.bulk_secs)
         finally:
             slot_pool.put(slot)

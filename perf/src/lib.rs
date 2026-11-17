@@ -99,6 +99,9 @@ pub struct CommonOpt {
     /// Max UDP payload size in bytes
     #[clap(long, default_value = "1472")]
     pub max_udp_payload_size: u16,
+    /// Implement fair queuing for outgoing streams with the same priority
+    #[clap(long = "send-fairness", default_value_t = true, action = clap::ArgAction::Set)]
+    pub send_fairness: bool,
     /// qlog output file
     #[cfg(feature = "qlog")]
     #[clap(long = "qlog")]
@@ -112,6 +115,7 @@ impl CommonOpt {
     ) -> io::Result<TransportConfig> {
         let mut transport = TransportConfig::default();
         transport.initial_mtu(self.initial_mtu);
+        transport.send_fairness(self.send_fairness);
 
         if let Some(initial_rtt) = self.initial_rtt {
             transport.initial_rtt(Duration::from_millis(initial_rtt));
@@ -325,6 +329,7 @@ mod tests {
         assert_eq!(opt.copa_jitter_ms, -1.0);
         assert!(opt.copa_drain);
         assert!(opt.copa_gentle_probe);
+        assert!(opt.send_fairness);
 
         let opt = CommonOpt::try_parse_from([
             "perf",
@@ -334,11 +339,14 @@ mod tests {
             "10",
             "--copa-drain=false",
             "--copa-gentle-probe=false",
+            "--send-fairness",
+            "false",
         ])
         .unwrap();
         assert_eq!(opt.copa_jitter_ms, 10.0);
         assert!(!opt.copa_drain);
         assert!(!opt.copa_gentle_probe);
+        assert!(!opt.send_fairness);
         opt.build_transport_config(
             #[cfg(feature = "qlog")]
             "test",

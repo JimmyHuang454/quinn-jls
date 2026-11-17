@@ -1,18 +1,30 @@
 name: Mahimahi Comparison (copa-auto vs Mortise)
 
 on:
+  push:
+    branches: ['codex/mahimahi-*']
+    paths:
+      - .github/workflows/mahimahi-compare.yml
+      - scripts/install_mahimahi.sh
+      - scripts/mahimahi_eval.py
+      - scripts/run_mahimahi_suite.py
   workflow_dispatch:
     inputs:
       mode:
-        description: "Experiment scope: smoke (1 trace fast check) or full (all 4 LTE + 23 NYC + 2 synthetic traces)"
+        description: "Quick is the small LTE comparison. Dataset check runs bulk across the three new datasets."
         required: true
-        default: "smoke"
+        default: "quick"
         type: choice
         options:
+          - quick
           - smoke
           - full
+          - nyc-subway
+          - lumos-5g
+          - leo
+          - datasets
       theta:
-        description: "Aggressive theta in [0.01, 0.99] for copa-auto-theta and copa-auto-nc-theta (默认模式/仅default mode, no competitive switching)"
+        description: "Theta in [0.01, 0.99] for the competitive and NC Copa-auto variants"
         required: true
         default: "0.98"
         type: string
@@ -37,14 +49,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        env:
+          MODE: ${{ inputs.mode || 'datasets' }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+
+          mode = os.environ['MODE']
+          shards = {
+              'quick': ['smoke'],
+              'full': ['lte', 'nyc-stat', 'nyc-walk-1', 'nyc-walk-2', 'nyc-walk-3',
+                       'nyc-drive-1', 'nyc-drive-2', 'synth', 'nyc-subway', 'lumos-5g'],
+              'datasets': ['nyc-subway', 'lumos-5g', 'leo'],
+          }.get(mode, [mode])
+          include = []
+          for shard in shards:
+              workloads = ['bulk'] if mode == 'datasets' or shard == 'leo' else ['bulk', 'app']
+              for workload in workloads:
+                  include.append({'shard': shard, 'workload': workload})
+          print('matrix=' + json.dumps({'include': include}))
+          PY
+
   quinn-eval:
-    name: quinn (${{ matrix.shard }})
+    name: quinn (${{ matrix.shard }}, ${{ matrix.workload }})
+    needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        shard: ${{ fromJson(github.event.inputs.mode == 'full' && '["lte","nyc-stat","nyc-walk-1","nyc-walk-2","nyc-walk-3","nyc-drive-1","nyc-drive-2","synth"]' || '["smoke"]') }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Checkout quinn-jls
         uses: actions/checkout@v4
@@ -62,13 +101,7 @@ jobs:
             autotools-dev autoconf libtool libssl-dev xcb \
             libxcb-composite0-dev libxcb-present-dev libcairo2-dev \
             libpango1.0-dev dnsmasq iproute2 python3 curl
-          sudo sysctl -w net.ipv4.ip_forward=1
-          git clone --depth 1 https://github.com/BobAnkh/mahimahi-prune.git /tmp/mahimahi
-          cd /tmp/mahimahi
-          ./autogen.sh
-          ./configure
-          make -j"$(nproc)"
-          sudo make install
+          bash scripts/install_mahimahi.sh "${{ matrix.shard }}"
 
       - name: Build quinn-perf
         run: cargo build --release -p perf
@@ -82,30 +115,49 @@ jobs:
 
       - name: Run quinn-perf Mahimahi suite (${{ matrix.shard }})
         env:
-          MODE: ${{ github.event.inputs.mode }}
-          THETA: ${{ github.event.inputs.theta }}
+          MODE: ${{ inputs.mode || 'datasets' }}
+          THETA: ${{ inputs.theta || '0.98' }}
           SHARD: ${{ matrix.shard }}
-          SEND_FAIRNESS: ${{ github.event.inputs.send_fairness }}
-          STREAM_RECEIVE_WINDOW: ${{ github.event.inputs.stream_receive_window }}
+          WORKLOAD: ${{ matrix.workload }}
+          SEND_FAIRNESS: ${{ inputs.send_fairness && 'true' || 'false' }}
+          STREAM_RECEIVE_WINDOW: ${{ inputs.stream_receive_window || '8M' }}
         run: |
           BULK_SECS=45
-          if [ "$MODE" = "smoke" ]; then
-            BULK_SECS=30
+          CCS="copa-auto,copa-auto-nc,copa-auto-theta${THETA},copa-auto-nc-theta${THETA},copa,bbr1,cubic"
+          QUEUES="150000,2000000"
+          PARALLEL=4
+          if [ "$SHARD" = "smoke" ]; then BULK_SECS=30; fi
+          if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then
+            CCS="copa,copa-auto,copa-auto-theta${THETA}"
+            QUEUES="150000"
           fi
           EXTRA_ARGS=()
+          if [ "$SHARD" = "lumos-5g" ]; then
+            QUEUES="2000000,16000000"
+            PARALLEL=2
+            EXTRA_ARGS+=(--connection-window 64M)
+            if [ "$MODE" = "datasets" ]; then QUEUES="2000000"; fi
+          fi
+          if [ "$SHARD" = "leo" ]; then
+            BULK_SECS=115
+            QUEUES="2000000,75000000"
+            PARALLEL=2
+            EXTRA_ARGS+=(--connection-window 64M)
+            if [ "$MODE" = "datasets" ]; then QUEUES="2000000"; fi
+          fi
           if [ -n "$STREAM_RECEIVE_WINDOW" ]; then
             EXTRA_ARGS+=(--stream-receive-window "$STREAM_RECEIVE_WINDOW")
           fi
           python3 scripts/run_mahimahi_suite.py \
             --stack quinn \
             --shard "$SHARD" \
-            --ccs "copa-auto,copa-auto-nc,copa-auto-theta${THETA},copa-auto-nc-theta${THETA},copa,bbr1,cubic" \
-            --queues "150000,2000000" \
-            --workloads "bulk,app" \
+            --ccs "$CCS" \
+            --queues "$QUEUES" \
+            --workloads "$WORKLOAD" \
             --bulk-secs "$BULK_SECS" \
             --send-fairness "$SEND_FAIRNESS" \
             "${EXTRA_ARGS[@]}" \
-            --parallel 4 \
+            --parallel "$PARALLEL" \
             --bin ./target/release/quinn-perf \
             --trace-dir /tmp/traces \
             --app-workload /tmp/workloads/app.wk \
@@ -113,20 +165,21 @@ jobs:
             --out-dir /tmp/quinn_out
 
       - name: Upload quinn-jls shard results
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: results-quinn-${{ matrix.shard }}
+          name: results-quinn-${{ matrix.shard }}-${{ matrix.workload }}
           path: /tmp/quinn_out
 
   mortise-eval:
-    name: mortise (${{ matrix.shard }})
-    if: ${{ github.event.inputs.run_mortise == true || github.event.inputs.run_mortise == 'true' }}
+    name: mortise (${{ matrix.shard }}, ${{ matrix.workload }})
+    needs: plan
+    if: ${{ github.event_name == 'push' || inputs.run_mortise }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        shard: ${{ fromJson(github.event.inputs.mode == 'full' && '["lte","nyc-stat","nyc-walk-1","nyc-walk-2","nyc-walk-3","nyc-drive-1","nyc-drive-2","synth"]' || '["smoke"]') }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Checkout quinn-jls (for runner & parser scripts)
         uses: actions/checkout@v4
@@ -149,7 +202,6 @@ jobs:
             linux-tools-common "linux-tools-$(uname -r)" || \
             sudo apt-get install -y -qq linux-tools-generic || true
 
-          sudo sysctl -w net.ipv4.ip_forward=1
           sudo modprobe tcp_bbr || true
           sudo sysctl -w net.ipv4.tcp_allowed_congestion_control="cubic reno bbr" || true
 
@@ -161,12 +213,7 @@ jobs:
           fi
           bpftool version || true
 
-          git clone --depth 1 https://github.com/BobAnkh/mahimahi-prune.git /tmp/mahimahi
-          cd /tmp/mahimahi
-          ./autogen.sh
-          ./configure
-          make -j"$(nproc)"
-          sudo make install
+          bash scripts/install_mahimahi.sh "${{ matrix.shard }}"
 
           sudo mkdir -p /home/vagrant
           sudo chown "$(id -u):$(id -g)" /home/vagrant
@@ -214,17 +261,30 @@ jobs:
 
       - name: Run Mortise Mahimahi suite (${{ matrix.shard }})
         env:
-          MODE: ${{ github.event.inputs.mode }}
+          MODE: ${{ inputs.mode || 'datasets' }}
           SHARD: ${{ matrix.shard }}
+          WORKLOAD: ${{ matrix.workload }}
         run: |
           set -euo pipefail
           OUT="/tmp/mortise_out"
           mkdir -p "$OUT" /tmp/workloads
           cp /tmp/Mortise/mortise/workload/app.wk /tmp/workloads/app.wk
-          python3 -c 'print("\n".join(["0\t2097152"] * 200))' > /tmp/workloads/bulk.wk
+          python3 -c 'print("0\t2097152\n" * 8192, end="")' > /tmp/workloads/bulk.wk
           BULK_SECS=45
-          if [ "$MODE" = "smoke" ]; then
-            BULK_SECS=30
+          QUEUES="150000,2000000"
+          PARALLEL=4
+          if [ "$SHARD" = "smoke" ]; then BULK_SECS=30; fi
+          if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then QUEUES="150000"; fi
+          if [ "$SHARD" = "lumos-5g" ]; then
+            QUEUES="2000000,16000000"
+            PARALLEL=2
+            if [ "$MODE" = "datasets" ]; then QUEUES="2000000"; fi
+          fi
+          if [ "$SHARD" = "leo" ]; then
+            BULK_SECS=115
+            QUEUES="2000000,75000000"
+            PARALLEL=2
+            if [ "$MODE" = "datasets" ]; then QUEUES="2000000"; fi
           fi
 
           RUNNER_SCRIPT="$PWD/scripts/run_mahimahi_suite.py"
@@ -254,7 +314,9 @@ jobs:
           sleep 2
 
           CCS="mortise_copa,bbr,cubic"
-          if [ "${COPA_KMOD:-0}" = "1" ]; then
+          if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then
+            CCS="mortise_copa"
+          elif [ "${COPA_KMOD:-0}" = "1" ]; then
             CCS="${CCS},copa"
           fi
 
@@ -262,10 +324,10 @@ jobs:
             --stack mortise \
             --shard "$SHARD" \
             --ccs "$CCS" \
-            --queues "150000,2000000" \
-            --workloads "bulk,app" \
+            --queues "$QUEUES" \
+            --workloads "$WORKLOAD" \
             --bulk-secs "$BULK_SECS" \
-            --parallel 4 \
+            --parallel "$PARALLEL" \
             --bin ./target/release/client \
             --trace-dir /tmp/traces \
             --app-workload /tmp/workloads/app.wk \
@@ -276,15 +338,16 @@ jobs:
           sudo kill "$MGR_PID" 2>/dev/null || true
 
       - name: Upload Mortise shard results
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: results-mortise-${{ matrix.shard }}
+          name: results-mortise-${{ matrix.shard }}-${{ matrix.workload }}
           path: /tmp/mortise_out
 
   summarize:
     name: Unified Comparison Summary
     needs: [quinn-eval, mortise-eval]
-    if: always() && (needs.quinn-eval.result == 'success' || needs.mortise-eval.result == 'success')
+    if: ${{ !cancelled() && (needs.quinn-eval.result != 'skipped' || needs.mortise-eval.result != 'skipped') }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout quinn-jls

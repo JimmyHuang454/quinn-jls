@@ -226,6 +226,12 @@ def fmt_num(val: Any, digits: int = 2) -> str:
 
 
 def trace_group(trace: str) -> str:
+    if trace.startswith("leo-starlink-"):
+        return "Starlink-" + trace.rsplit("-", 1)[-1]
+    if trace.startswith("nyc2018-4g-subway-"):
+        return trace
+    if trace.startswith("5g_trace_"):
+        return "Lumos5G-" + trace.rsplit("_", 1)[-1]
     if "LTE-driving" in trace:
         return "LTE-driving"
     if trace.endswith("-home1") or trace.endswith("-home3") or trace.endswith("-home") or trace in {
@@ -267,8 +273,10 @@ def main() -> None:
         warmup = args.bulk_warmup_s if is_bulk else 0.0
         max_s = args.bulk_end_s if is_bulk else None
 
-        row: dict[str, Any] = {**meta}
-        row.update(parse_downlink_log(log_path, min_rtt_ms=args.min_rtt_ms, warmup_s=warmup, max_s=max_s))
+        rtt_file = log_path.with_name(f"{meta['trace']}.base-rtt-ms")
+        base_rtt_ms = float(rtt_file.read_text()) if rtt_file.exists() else args.min_rtt_ms
+        row: dict[str, Any] = {**meta, "base_rtt_ms": base_rtt_ms}
+        row.update(parse_downlink_log(log_path, min_rtt_ms=base_rtt_ms, warmup_s=warmup, max_s=max_s))
 
         rct_path = log_path.with_name(f"{stem}.rct.csv")
         row.update(parse_rct_csv(rct_path, delivered_bytes=row.get("delivered_bytes", 0)))
@@ -296,6 +304,7 @@ def main() -> None:
         "utilization",
         "qdelay_avg_ms",
         "qdelay_p95_ms",
+        "base_rtt_ms",
         "est_rtt_ms",
         "util_power",
         "norm_power",

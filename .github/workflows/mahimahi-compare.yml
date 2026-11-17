@@ -1,0 +1,251 @@
+name: Mahimahi Comparison (copa-auto vs Mortise)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Experiment scope: smoke (1 trace fast check) or full (all 4 LTE + 23 NYC + 2 synthetic traces)"
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - full
+      run_mortise:
+        description: "Also build and run official BobAnkh/Mortise in parallel"
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: mahimahi-compare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quinn-eval:
+    name: quinn (${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(github.event.inputs.mode == 'full' && '["lte","nyc-stat","nyc-walk-1","nyc-walk-2","nyc-walk-3","nyc-drive-1","nyc-drive-2","synth"]' || '["smoke"]') }}
+    steps:
+      - name: Checkout quinn-jls
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Mahimahi (pruned) & dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            autotools-dev autoconf libtool libssl-dev xcb \
+            libxcb-composite0-dev libxcb-present-dev libcairo2-dev \
+            libpango1.0-dev dnsmasq iproute2 python3 curl
+          sudo sysctl -w net.ipv4.ip_forward=1
+          git clone --depth 1 https://github.com/BobAnkh/mahimahi-prune.git /tmp/mahimahi
+          cd /tmp/mahimahi
+          ./autogen.sh
+          ./configure
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Build quinn-perf
+        run: cargo build --release -p perf
+
+      - name: Prepare workloads
+        run: |
+          mkdir -p /tmp/workloads
+          curl -fsSL --retry 3 -o /tmp/workloads/app.wk \
+            "https://raw.githubusercontent.com/BobAnkh/Mortise/main/mortise/workload/app.wk"
+          python3 -c 'print("\n".join(["0\t2097152"] * 15))' > /tmp/workloads/bulk.wk
+
+      - name: Run quinn-perf Mahimahi suite (${{ matrix.shard }})
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          BULK_SECS=45
+          if [ "$MODE" = "smoke" ]; then
+            BULK_SECS=30
+          fi
+          python3 scripts/run_mahimahi_suite.py \
+            --stack quinn \
+            --shard "$SHARD" \
+            --ccs "copa-auto,copa-auto-nc,copa,bbr1,cubic" \
+            --queues "150000,2000000" \
+            --workloads "bulk,app" \
+            --bulk-secs "$BULK_SECS" \
+            --parallel 4 \
+            --bin ./target/release/quinn-perf \
+            --trace-dir /tmp/traces \
+            --app-workload /tmp/workloads/app.wk \
+            --bulk-workload /tmp/workloads/bulk.wk \
+            --out-dir /tmp/quinn_out
+
+      - name: Upload quinn-jls shard results
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-quinn-${{ matrix.shard }}
+          path: /tmp/quinn_out
+
+  mortise-eval:
+    name: mortise (${{ matrix.shard }})
+    if: ${{ github.event.inputs.run_mortise == true || github.event.inputs.run_mortise == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(github.event.inputs.mode == 'full' && '["lte","nyc-stat","nyc-walk-1","nyc-walk-2","nyc-walk-3","nyc-drive-1","nyc-drive-2","synth"]' || '["smoke"]') }}
+    steps:
+      - name: Checkout quinn-jls (for runner & parser scripts)
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Clone BobAnkh/Mortise
+        run: git clone --depth 1 https://github.com/BobAnkh/Mortise.git /tmp/Mortise
+
+      - name: Install Mahimahi, eBPF toolchain, and Python deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            autotools-dev autoconf libtool libssl-dev xcb \
+            libxcb-composite0-dev libxcb-present-dev libcairo2-dev \
+            libpango1.0-dev dnsmasq iproute2 \
+            clang llvm libbpf-dev libelf-dev dwarves pkg-config \
+            build-essential python3-pip python3-venv curl \
+            linux-tools-common "linux-tools-$(uname -r)" || \
+            sudo apt-get install -y -qq linux-tools-generic || true
+
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo modprobe tcp_bbr || true
+          sudo sysctl -w net.ipv4.tcp_allowed_congestion_control="cubic reno bbr" || true
+
+          if ! command -v bpftool >/dev/null 2>&1; then
+            BPFTOOL_BIN=$(find /usr/lib/linux-tools* /usr/sbin /usr/bin -name bpftool -type f 2>/dev/null | head -n1 || true)
+            if [ -n "$BPFTOOL_BIN" ]; then
+              sudo ln -sf "$BPFTOOL_BIN" /usr/local/bin/bpftool
+            fi
+          fi
+          bpftool version || true
+
+          git clone --depth 1 https://github.com/BobAnkh/mahimahi-prune.git /tmp/mahimahi
+          cd /tmp/mahimahi
+          ./autogen.sh
+          ./configure
+          make -j"$(nproc)"
+          sudo make install
+
+          sudo mkdir -p /home/vagrant
+          sudo chown "$(id -u):$(id -g)" /home/vagrant
+          python3 -m venv /home/vagrant/mortise-venv
+          source /home/vagrant/mortise-venv/bin/activate
+          pip install -q numpy structlog scipy pandas
+          ln -sfn /tmp/Mortise/algorithm /home/vagrant/algorithm
+
+      - name: Build Mortise BPF object and Rust binaries
+        run: |
+          cd /tmp/Mortise/algorithm/bpf-kern
+          make build/mortise_copa.bpf.o
+          cd /tmp/Mortise/mortise
+          cargo build --release --all
+
+          cd /tmp/Mortise/algorithm/kern-mod
+          if make && sudo make install; then
+            echo "COPA_KMOD=1" >> "$GITHUB_ENV"
+          else
+            echo "WARN: kern-mod copa skipped on kernel $(uname -r)"
+            echo "COPA_KMOD=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run Mortise Mahimahi suite (${{ matrix.shard }})
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          OUT="/tmp/mortise_out"
+          mkdir -p "$OUT" /tmp/workloads
+          cp /tmp/Mortise/mortise/workload/app.wk /tmp/workloads/app.wk
+          python3 -c 'print("\n".join(["0\t2097152"] * 15))' > /tmp/workloads/bulk.wk
+
+          RUNNER_SCRIPT="$PWD/scripts/run_mahimahi_suite.py"
+          cd /tmp/Mortise/mortise
+
+          source /home/vagrant/mortise-venv/bin/activate
+          LOG_LEVEL=warn python3 process-report.py > "$OUT/process_report.log" 2>&1 &
+          PY_PID=$!
+          sleep 2
+
+          RUST_LOG=info sudo -E ./target/release/manager > "$OUT/manager.log" 2>&1 &
+          MGR_PID=$!
+          sleep 3
+
+          ./target/release/server > "$OUT/server.log" 2>&1 &
+          SRV_PID=$!
+          sleep 2
+
+          CCS="mortise_copa,bbr,cubic"
+          if [ "${COPA_KMOD:-0}" = "1" ]; then
+            CCS="${CCS},copa"
+          fi
+
+          python3 "$RUNNER_SCRIPT" \
+            --stack mortise \
+            --shard "$SHARD" \
+            --ccs "$CCS" \
+            --queues "150000,2000000" \
+            --workloads "bulk,app" \
+            --parallel 4 \
+            --bin ./target/release/client \
+            --trace-dir /tmp/traces \
+            --app-workload /tmp/workloads/app.wk \
+            --bulk-workload /tmp/workloads/bulk.wk \
+            --out-dir "$OUT"
+
+          kill "$SRV_PID" "$PY_PID" 2>/dev/null || true
+          sudo kill "$MGR_PID" 2>/dev/null || true
+
+      - name: Upload Mortise shard results
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-mortise-${{ matrix.shard }}
+          path: /tmp/mortise_out
+
+  summarize:
+    name: Unified Comparison Summary
+    needs: [quinn-eval, mortise-eval]
+    if: always() && (needs.quinn-eval.result == 'success' || needs.mortise-eval.result == 'success')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout quinn-jls
+        uses: actions/checkout@v4
+
+      - name: Download all shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: /tmp/all_results
+
+      - name: Analyze and write summary
+        run: |
+          mkdir -p /tmp/summary
+          python3 scripts/mahimahi_eval.py \
+            --input-dir /tmp/all_results \
+            --out-csv /tmp/summary/comparison_summary.csv \
+            --out-md /tmp/summary/comparison_summary.md \
+            --min-rtt-ms 20.0
+          cat /tmp/summary/comparison_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unified comparison summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: comparison-summary
+          path: /tmp/summary

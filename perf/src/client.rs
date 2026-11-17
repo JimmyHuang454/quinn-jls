@@ -1,10 +1,12 @@
 #[cfg(feature = "json-output")]
 use std::path::PathBuf;
 use std::{
+    fs,
+    io::{BufWriter, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -13,6 +15,7 @@ use clap::Parser;
 use quinn::{crypto::rustls::QuicClientConfig, TokioRuntime};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{debug, error, info};
 
 use crate::{
@@ -59,6 +62,16 @@ pub struct Opt {
     /// The interval in seconds at which stats are reported
     #[clap(long, default_value = "1")]
     interval: u64,
+    /// Mortise-format workload trace (`<gap_ms> <size_bytes>` per line); replaces fixed uni/bi loops
+    #[clap(long)]
+    workload: Option<PathBuf>,
+    /// Output CSV path for per-request RCT records (`id,size,client_send,server_recv,client_recv,rct`)
+    #[clap(long)]
+    rct_csv: Option<PathBuf>,
+    /// Output JSON path for connection-level path statistics
+    #[cfg(feature = "json-output")]
+    #[clap(long)]
+    summary_json: Option<PathBuf>,
     /// File path to output JSON statistics to. If the file is '-', stdout will be used
     #[cfg(feature = "json-output")]
     #[clap(long)]
@@ -143,23 +156,42 @@ pub async fn run(opt: Opt) -> Result<()> {
 
     info!("established");
 
+    let workload_items = match &opt.workload {
+        Some(path) => Some(load_workload(path)?),
+        None => None,
+    };
+    let is_workload = workload_items.is_some();
+    let rct_records = Arc::new(Mutex::new(Vec::<RctRecord>::new()));
+    let run_start = Instant::now();
+
     let drive_fut = async {
-        tokio::try_join!(
-            drive_uni(
+        if let Some(items) = workload_items {
+            drive_workload(
                 connection.clone(),
                 stream_stats.clone(),
-                opt.uni_requests,
-                opt.upload_size,
-                opt.download_size
-            ),
-            drive_bi(
-                connection.clone(),
-                stream_stats.clone(),
-                opt.bi_requests,
-                opt.upload_size,
-                opt.download_size
+                items,
+                rct_records.clone(),
             )
-        )
+            .await
+        } else {
+            tokio::try_join!(
+                drive_uni(
+                    connection.clone(),
+                    stream_stats.clone(),
+                    opt.uni_requests,
+                    opt.upload_size,
+                    opt.download_size
+                ),
+                drive_bi(
+                    connection.clone(),
+                    stream_stats.clone(),
+                    opt.bi_requests,
+                    opt.upload_size,
+                    opt.download_size
+                )
+            )
+            .map(|_| ())
+        }
     };
 
     let mut stats = Stats::default();
@@ -189,7 +221,15 @@ pub async fn run(opt: Opt) -> Result<()> {
     };
 
     tokio::select! {
-        _ = drive_fut => {}
+        res = drive_fut => {
+            if let Err(e) = res {
+                error!("drive failed: {:#}", e);
+            }
+            if is_workload {
+                info!("workload finished, shutting down");
+                connection.close(0u32.into(), b"done");
+            }
+        }
         _ = stats_fut => {}
         _ = tokio::signal::ctrl_c() => {
             info!("shutting down");
@@ -202,7 +242,21 @@ pub async fn run(opt: Opt) -> Result<()> {
         }
     }
 
+    let final_stats = connection.stats();
+    let elapsed_s = run_start.elapsed().as_secs_f64();
     endpoint.wait_idle().await;
+
+    if let Some(path) = &opt.rct_csv {
+        let mut records = rct_records.lock().unwrap().clone();
+        records.sort_by_key(|r| r.id);
+        write_rct_csv(path, &records, final_stats.path.lost_packets)?;
+    }
+
+    #[cfg(feature = "json-output")]
+    if let Some(path) = &opt.summary_json {
+        let completed = rct_records.lock().unwrap().len();
+        write_summary_json(path, &final_stats, elapsed_s, completed)?;
+    }
 
     #[cfg(feature = "json-output")]
     if let Some(path) = opt.json {
@@ -423,5 +477,161 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RctRecord {
+    id: usize,
+    size: u64,
+    client_send_ns: u128,
+    client_recv_ns: u128,
+    rct_ms: u64,
+}
+
+fn parse_workload_str(content: &str) -> Result<Vec<(Duration, u64)>> {
+    let mut items = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let gap_ms = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .with_context(|| format!("invalid gap_ms at workload line {}", idx + 1))?;
+        let size = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .with_context(|| format!("invalid size_bytes at workload line {}", idx + 1))?;
+        items.push((Duration::from_millis(gap_ms), size));
+    }
+    Ok(items)
+}
+
+fn load_workload(path: &Path) -> Result<Vec<(Duration, u64)>> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("reading workload {}", path.display()))?;
+    parse_workload_str(&content)
+}
+
+fn now_epoch_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+async fn drive_workload(
+    connection: quinn::Connection,
+    stream_stats: OpenStreamStats,
+    items: Vec<(Duration, u64)>,
+    rct_records: Arc<Mutex<Vec<RctRecord>>>,
+) -> Result<()> {
+    let mut scheduled = Instant::now();
+    let mut tasks = JoinSet::new();
+
+    for (idx, (gap, size)) in items.into_iter().enumerate() {
+        if !gap.is_zero() {
+            scheduled += gap;
+            tokio::time::sleep_until(scheduled.into()).await;
+        }
+        let id = idx + 1;
+        let conn = connection.clone();
+        let stream_stats = stream_stats.clone();
+        let rct_records = rct_records.clone();
+        tasks.spawn(async move {
+            let client_send_ns = now_epoch_ns();
+            let req_start = Instant::now();
+            let (send, recv) = conn.open_bi().await?;
+            request_bi(send, recv, 0, size, stream_stats).await?;
+            let rct_ms = req_start.elapsed().as_millis() as u64;
+            let client_recv_ns = now_epoch_ns();
+            rct_records.lock().unwrap().push(RctRecord {
+                id,
+                size,
+                client_send_ns,
+                client_recv_ns,
+                rct_ms,
+            });
+            Ok::<(), anyhow::Error>(())
+        });
+    }
+
+    while let Some(res) = tasks.join_next().await {
+        res.context("workload request task panicked")??;
+    }
+
+    Ok(())
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_rct_csv(path: &Path, records: &[RctRecord], lost_packets: u64) -> Result<()> {
+    ensure_parent_dir(path)?;
+    let file = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut w = BufWriter::new(file);
+    writeln!(w, "id,size,client_send,server_recv,client_recv,rct")?;
+    for r in records {
+        writeln!(
+            w,
+            "{},{},{},0,{},{}",
+            r.id, r.size, r.client_send_ns, r.client_recv_ns, r.rct_ms
+        )?;
+    }
+    writeln!(w, "0,0,0,{lost_packets},0,0")?;
+    w.flush()?;
+    Ok(())
+}
+
+#[cfg(feature = "json-output")]
+fn write_summary_json(
+    path: &Path,
+    stats: &quinn::ConnectionStats,
+    elapsed_s: f64,
+    requests_completed: usize,
+) -> Result<()> {
+    ensure_parent_dir(path)?;
+    let summary = serde_json::json!({
+        "elapsed_s": elapsed_s,
+        "requests_completed": requests_completed,
+        "udp_tx_bytes": stats.udp_tx.bytes,
+        "udp_rx_bytes": stats.udp_rx.bytes,
+        "sent_packets": stats.path.sent_packets,
+        "lost_packets": stats.path.lost_packets,
+        "lost_bytes": stats.path.lost_bytes,
+        "congestion_events": stats.path.congestion_events,
+        "rtt_ms": stats.path.rtt.as_secs_f64() * 1000.0,
+        "min_rtt_ms": stats.path.min_rtt.as_secs_f64() * 1000.0,
+    });
+    let file = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    serde_json::to_writer_pretty(file, &summary)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_mortise_workload() {
+        let input = "0\t359246\n4485\t161520\n# comment\n\n24 33164\n";
+        let parsed = parse_workload_str(input).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                (Duration::from_millis(0), 359246),
+                (Duration::from_millis(4485), 161520),
+                (Duration::from_millis(24), 33164),
+            ]
+        );
     }
 }

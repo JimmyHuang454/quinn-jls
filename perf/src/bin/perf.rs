@@ -27,6 +27,7 @@ async fn main() {
     };
     if let Err(e) = r {
         error!("{:#}", e);
+        std::process::exit(1);
     }
 }
 

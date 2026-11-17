@@ -8,9 +8,13 @@ import concurrent.futures
 import queue
 import random
 import subprocess
+import threading
 import time
 import urllib.request
 from pathlib import Path
+
+# Serialize mm-delay/mm-link startup to avoid Mahimahi 100.64.x address allocation races.
+MM_LAUNCH_LOCK = threading.Lock()
 
 LTE_TRACES = [
     "ATT-LTE-driving-2016",
@@ -143,6 +147,21 @@ def prepare_trace_pair(trace_name: str, trace_dir: Path) -> tuple[Path, Path]:
     raise ValueError(f"Unknown trace: {trace_name}")
 
 
+def run_mm_cmd(mm_cmd: list[str], expected_out: Path) -> subprocess.CompletedProcess[str]:
+    """Launch mm-delay/mm-link with staggered startup and 1 retry on transient setup failure."""
+    for attempt in range(2):
+        with MM_LAUNCH_LOCK:
+            proc = subprocess.Popen(mm_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            time.sleep(1.5)
+        stdout, stderr = proc.communicate()
+        res = subprocess.CompletedProcess(mm_cmd, proc.returncode, stdout, stderr)
+        if res.returncode == 0 and expected_out.exists():
+            return res
+        if attempt == 0:
+            time.sleep(2.0)
+    return res
+
+
 def run_quinn_job(
     slot: int,
     bin_path: Path,
@@ -163,24 +182,24 @@ def run_quinn_job(
     srv_log = out_dir / f"{stem}.server.log"
 
     srv = subprocess.Popen(
-        [str(bin_path), "server", "--listen", f"0.0.0.0:{port}", "--congestion", cc],
+        [str(bin_path), "server", "--listen", f"0.0.0.0:{port}", "--congestion", cc, "--initial-mtu", "1450"],
         stdout=srv_log.open("w"),
         stderr=subprocess.STDOUT,
     )
     try:
-        time.sleep(0.5)
+        time.sleep(0.8)
         if workload_kind == "bulk":
             client_cmd = (
                 f'timeout {bulk_secs + 60} "{bin_path}" client "${{MAHIMAHI_BASE}}:{port}" '
-                f'--ip "${{MAHIMAHI_BASE}}" --congestion "{cc}" '
-                f'--bi-requests 1 --download-size 2M --duration {bulk_secs} '
+                f'--ip "${{MAHIMAHI_BASE}}" --congestion "{cc}" --initial-mtu 1450 '
+                f'--bi-requests 1 --download-size 500M --duration {bulk_secs} '
                 f'--summary-json "{sum_path}" --json "{out_dir / (stem + ".iperf.json")}"'
             )
         else:
             rct_path = out_dir / f"{stem}.rct.csv"
             client_cmd = (
                 f'timeout 220 "{bin_path}" client "${{MAHIMAHI_BASE}}:{port}" '
-                f'--ip "${{MAHIMAHI_BASE}}" --congestion "{cc}" '
+                f'--ip "${{MAHIMAHI_BASE}}" --congestion "{cc}" --initial-mtu 1450 '
                 f'--workload "{workload_path}" --duration 200 '
                 f'--rct-csv "{rct_path}" --summary-json "{sum_path}"'
             )
@@ -201,8 +220,8 @@ def run_quinn_job(
             "-c",
             client_cmd,
         ]
-        res = subprocess.run(mm_cmd, capture_output=True, text=True)
-        if res.returncode != 0:
+        res = run_mm_cmd(mm_cmd, sum_path)
+        if res.returncode != 0 or not sum_path.exists():
             (out_dir / f"{stem}.err.log").write_text(res.stdout + "\n" + res.stderr, encoding="utf-8")
         return stem, res.returncode
     finally:
@@ -249,8 +268,8 @@ def run_mortise_job(
         "-c",
         client_cmd,
     ]
-    res = subprocess.run(mm_cmd, capture_output=True, text=True)
-    if res.returncode != 0:
+    res = run_mm_cmd(mm_cmd, rct_path)
+    if res.returncode != 0 or not rct_path.exists():
         (out_dir / f"{stem}.err.log").write_text(res.stdout + "\n" + res.stderr, encoding="utf-8")
     return stem, res.returncode
 

@@ -153,7 +153,29 @@ jobs:
 
       - name: Build Mortise BPF object and Rust binaries
         run: |
+          uname -r
           cd /tmp/Mortise/algorithm/bpf-kern
+          rm -f include/vmlinux.h
+          make vmlinux
+          python3 - << 'PY'
+          import pathlib, re
+          vml = pathlib.Path("include/vmlinux.h").read_text(errors="ignore")
+          m = re.search(r"struct\s+tcp_congestion_ops\s*\{(.*?)\};", vml, re.S)
+          assert m, "struct tcp_congestion_ops not found in vmlinux.h"
+          for line in m.group(1).splitlines():
+              if "cong_control" in line:
+                  print("Kernel cong_control signature:", line.strip())
+          if re.search(r"\(\*cong_control\)\s*\([^)]*u32[^)]*int[^)]*rate_sample", m.group(1)):
+              p = pathlib.Path("mortise_copa.bpf.c")
+              src = p.read_text()
+              old = "BPF_PROG(bpf_copa_main, struct sock *sk, const struct rate_sample *rs)"
+              new = "BPF_PROG(bpf_copa_main, struct sock *sk, u32 ack, int flag, const struct rate_sample *rs)"
+              assert old in src, "expected bpf_copa_main signature not found"
+              p.write_text(src.replace(old, new, 1))
+              print("Patched bpf_copa_main for 4-arg cong_control ABI (Linux >= 6.10)")
+          else:
+              print("Keeping 2-arg bpf_copa_main ABI")
+          PY
           make build/mortise_copa.bpf.o
           cd /tmp/Mortise/mortise
           cargo build --release -p mortise-manager -p traffic
@@ -186,7 +208,17 @@ jobs:
 
           RUST_LOG=info sudo -E ./target/release/manager > "$OUT/manager.log" 2>&1 &
           MGR_PID=$!
-          sleep 3
+          for _ in $(seq 1 20); do
+            [ -S /tmp/mortise.sock ] && break
+            sleep 1
+          done
+          sleep 2
+
+          cat "$OUT/manager.log"
+          if grep -q "Fail to load" "$OUT/manager.log" || ! grep -q "Load mortise_copa" "$OUT/manager.log"; then
+            echo "ERROR: mortise_copa BPF failed to load!"
+            exit 1
+          fi
 
           ./target/release/server > "$OUT/server.log" 2>&1 &
           SRV_PID=$!

@@ -7,8 +7,6 @@ import argparse
 import csv
 import json
 import math
-import os
-import re
 from pathlib import Path
 from typing import Any
 
@@ -35,14 +33,16 @@ def percentile(sorted_vals: list[float], p: float) -> float:
     return sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f)
 
 
-def parse_downlink_log(path: Path, min_rtt_ms: float = 20.0) -> dict[str, Any]:
-    """Parse Mahimahi mm-link --downlink-log into throughput, delay, loss, and power."""
+def parse_downlink_log(
+    path: Path,
+    min_rtt_ms: float = 20.0,
+    warmup_s: float = 0.0,
+    max_s: float | None = None,
+) -> dict[str, Any]:
+    """Parse Mahimahi mm-link --downlink-log over [warmup_s, max_s] relative to first timestamp."""
+    entries: list[tuple[float, str, int, float]] = []
     first_ts: float | None = None
     last_ts: float | None = None
-    delivered_bytes = 0
-    opportunity_bytes = 0
-    dropped_bytes = 0
-    qdelays: list[float] = []
 
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -62,17 +62,59 @@ def parse_downlink_log(path: Path, min_rtt_ms: float = 20.0) -> dict[str, Any]:
             last_ts = ts
 
             kind = parts[1]
-            if kind == "#":
-                opportunity_bytes += int(parts[2])
-            elif kind == "-":
-                delivered_bytes += int(parts[2])
-                if len(parts) >= 4:
-                    qdelays.append(float(parts[3]))
+            if kind == "#" or kind == "-":
+                nbytes = int(parts[2])
+                qdelay = float(parts[3]) if (kind == "-" and len(parts) >= 4) else math.nan
+                entries.append((ts, kind, nbytes, qdelay))
             elif kind == "d":
-                # Format: `<ts> d <drops> <bytes>`
-                dropped_bytes += int(parts[3]) if len(parts) >= 4 else int(parts[2])
+                nbytes = int(parts[3]) if len(parts) >= 4 else int(parts[2])
+                entries.append((ts, kind, nbytes, math.nan))
 
-    duration_s = (last_ts - first_ts) / 1000.0 if (first_ts is not None and last_ts is not None and last_ts > first_ts) else math.nan
+    if first_ts is None or last_ts is None or last_ts <= first_ts:
+        return {
+            "duration_s": math.nan,
+            "delivered_bytes": 0,
+            "capacity_mbps": math.nan,
+            "throughput_mbps": math.nan,
+            "utilization": math.nan,
+            "qdelay_avg_ms": math.nan,
+            "qdelay_p95_ms": math.nan,
+            "est_rtt_ms": math.nan,
+            "util_power": math.nan,
+            "norm_power": math.nan,
+            "tput_power": math.nan,
+            "drop_rate": math.nan,
+        }
+
+    total_span_s = (last_ts - first_ts) / 1000.0
+    # If the run finished too early (e.g., short legacy trace), skip warmup filter so metrics stay valid.
+    eff_warmup_s = warmup_s if total_span_s > warmup_s + 2.0 else 0.0
+    win_start_ts = first_ts + eff_warmup_s * 1000.0
+    win_end_ts = (first_ts + max_s * 1000.0) if (max_s is not None and total_span_s > eff_warmup_s + 2.0) else last_ts
+
+    delivered_bytes = 0
+    opportunity_bytes = 0
+    dropped_bytes = 0
+    qdelays: list[float] = []
+    act_start: float | None = None
+    act_end: float | None = None
+
+    for ts, kind, nbytes, qdelay in entries:
+        if ts < win_start_ts or ts > win_end_ts:
+            continue
+        if act_start is None:
+            act_start = ts
+        act_end = ts
+        if kind == "#":
+            opportunity_bytes += nbytes
+        elif kind == "-":
+            delivered_bytes += nbytes
+            if not math.isnan(qdelay):
+                qdelays.append(qdelay)
+        elif kind == "d":
+            dropped_bytes += nbytes
+
+    duration_s = (act_end - act_start) / 1000.0 if (act_start is not None and act_end is not None and act_end > act_start) else math.nan
     tput_mbps = (delivered_bytes * 8.0 / 1e6 / duration_s) if duration_s and duration_s > 0 else math.nan
     cap_mbps = (opportunity_bytes * 8.0 / 1e6 / duration_s) if duration_s and duration_s > 0 else math.nan
     util = (delivered_bytes / opportunity_bytes) if opportunity_bytes > 0 else math.nan
@@ -82,6 +124,7 @@ def parse_downlink_log(path: Path, min_rtt_ms: float = 20.0) -> dict[str, Any]:
     qdelay_p95 = percentile(qdelays, 0.95)
     est_rtt_ms = (min_rtt_ms + qdelay_avg) if not math.isnan(qdelay_avg) else math.nan
     util_power = (util / (est_rtt_ms / 1000.0)) if (est_rtt_ms and est_rtt_ms > 0 and not math.isnan(util)) else math.nan
+    norm_power = (util / (est_rtt_ms / min_rtt_ms)) if (est_rtt_ms and est_rtt_ms > 0 and not math.isnan(util)) else math.nan
     tput_power = (tput_mbps / est_rtt_ms) if (est_rtt_ms and est_rtt_ms > 0 and not math.isnan(tput_mbps)) else math.nan
 
     total_offered = delivered_bytes + dropped_bytes
@@ -97,6 +140,7 @@ def parse_downlink_log(path: Path, min_rtt_ms: float = 20.0) -> dict[str, Any]:
         "qdelay_p95_ms": qdelay_p95,
         "est_rtt_ms": est_rtt_ms,
         "util_power": util_power,
+        "norm_power": norm_power,
         "tput_power": tput_power,
         "drop_rate": drop_rate,
     }
@@ -120,7 +164,6 @@ def parse_rct_csv(path: Path, delivered_bytes: int = 0) -> dict[str, Any]:
     if not rows:
         return {}
 
-    # Last row in Mortise CSV is `0,0,0,<retrans_pkts>,0,0`
     data_rows = rows
     if len(rows[-1]) >= 4 and rows[-1][0] == "0":
         try:
@@ -147,8 +190,6 @@ def parse_rct_csv(path: Path, delivered_bytes: int = 0) -> dict[str, Any]:
     total_pkts = max(delivered_bytes / 1448.0, sum(sizes) / 1448.0, 1.0)
     retrans_ratio = retrans_pkts / total_pkts
     penalty = mortise_retrans_penalty(retrans_ratio)
-
-    # Mortise Eq. 6 normalized QoE: (R / RCT_s) * (1 - P(r)) in MB/s
     qoe_vals = [((sz / 1e6) / (rct / 1000.0)) * (1.0 - penalty) for sz, rct in zip(sizes, rcts_ms)]
 
     return {
@@ -212,6 +253,8 @@ def main() -> None:
     parser.add_argument("--out-csv", required=True, type=Path, help="Output summary CSV")
     parser.add_argument("--out-md", required=True, type=Path, help="Output summary Markdown")
     parser.add_argument("--min-rtt-ms", type=float, default=20.0, help="Base propagation RTT in ms")
+    parser.add_argument("--bulk-warmup-s", type=float, default=5.0, help="Warmup seconds skipped for bulk runs")
+    parser.add_argument("--bulk-end-s", type=float, default=None, help="Optional end timestamp (s) for bulk window")
     args = parser.parse_args()
 
     logs = sorted(args.input_dir.rglob("*.downlink.log"))
@@ -220,8 +263,12 @@ def main() -> None:
     for log_path in logs:
         stem = log_path.name[: -len(".downlink.log")]
         meta = parse_meta_from_stem(stem)
+        is_bulk = meta["workload"] == "bulk"
+        warmup = args.bulk_warmup_s if is_bulk else 0.0
+        max_s = args.bulk_end_s if is_bulk else None
+
         row: dict[str, Any] = {**meta}
-        row.update(parse_downlink_log(log_path, min_rtt_ms=args.min_rtt_ms))
+        row.update(parse_downlink_log(log_path, min_rtt_ms=args.min_rtt_ms, warmup_s=warmup, max_s=max_s))
 
         rct_path = log_path.with_name(f"{stem}.rct.csv")
         row.update(parse_rct_csv(rct_path, delivered_bytes=row.get("delivered_bytes", 0)))
@@ -251,6 +298,7 @@ def main() -> None:
         "qdelay_p95_ms",
         "est_rtt_ms",
         "util_power",
+        "norm_power",
         "tput_power",
         "drop_rate",
         "requests",
@@ -269,72 +317,77 @@ def main() -> None:
         for r in records:
             writer.writerow(r)
 
-    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+    bulk_groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    app_groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
     for r in records:
         gk = (
-            r.get("workload", "-"),
             trace_group(r.get("trace", "")),
             r.get("queue_bytes", "-"),
             r.get("stack", "-"),
             r.get("cc", "-"),
         )
-        groups.setdefault(gk, []).append(r)
+        if r.get("workload") == "bulk":
+            bulk_groups.setdefault(gk, []).append(r)
+        else:
+            app_groups.setdefault(gk, []).append(r)
 
     lines = [
         "# Mahimahi Comparison Summary (`quinn-jls` vs `BobAnkh/Mortise`)",
         "",
-        "## Grouped Averages",
+        f"Bulk metrics skip the first `{args.bulk_warmup_s:.1f}s` warmup window.",
         "",
-        "| Workload | Trace Group | Queue (B) | Stack | CC | N | Thr (Mbps) | Util | QDelay Avg (ms) | Power (Util/s) | Drop | Mean RCT (ms) | Mortise QoE |",
-        "|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "## 1. Bulk Saturated Flows (Kleinrock Power & Delay-Utilization Tradeoff)",
+        "",
+        "| Trace Group | Queue (B) | Stack | CC | N | Cap (Mbps) | Thr (Mbps) | Util | QDelay Avg (ms) | QDelay P95 (ms) | Power (Util/s) | Norm Power | Drop |",
+        "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for gk in sorted(groups.keys()):
-        wk, grp, q, stk, cc = gk
-        grows = groups[gk]
+    for gk in sorted(bulk_groups.keys()):
+        grp, q, stk, cc = gk
+        grows = bulk_groups[gk]
         lines.append(
-            "| {wk} | {grp} | {q} | {stk} | {cc} | {n} | {thr} | {util} | {qd} | {pwr} | {drop} | {rct} | {qoe} |".format(
-                wk=wk,
+            "| {grp} | {q} | {stk} | {cc} | {n} | {cap} | {thr} | {util} | {qd} | {qdp95} | {pwr} | {npwr} | {drop} |".format(
+                grp=grp,
+                q=q,
+                stk=stk,
+                cc=cc,
+                n=len(grows),
+                cap=fmt_num(mean_valid(grows, "capacity_mbps")),
+                thr=fmt_num(mean_valid(grows, "throughput_mbps")),
+                util=fmt_num(mean_valid(grows, "utilization"), 3),
+                qd=fmt_num(mean_valid(grows, "qdelay_avg_ms")),
+                qdp95=fmt_num(mean_valid(grows, "qdelay_p95_ms")),
+                pwr=fmt_num(mean_valid(grows, "util_power")),
+                npwr=fmt_num(mean_valid(grows, "norm_power"), 3),
+                drop=fmt_num(mean_valid(grows, "drop_rate"), 4),
+            )
+        )
+
+    lines.extend([
+        "",
+        "## 2. File Download Workload (`app.wk`: RCT & Mortise QoE)",
+        "",
+        "| Trace Group | Queue (B) | Stack | CC | N | Thr (Mbps) | QDelay Avg (ms) | Drop | Mean RCT (ms) | P95 RCT (ms) | Mortise QoE |",
+        "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for gk in sorted(app_groups.keys()):
+        grp, q, stk, cc = gk
+        grows = app_groups[gk]
+        lines.append(
+            "| {grp} | {q} | {stk} | {cc} | {n} | {thr} | {qd} | {drop} | {rct} | {rct95} | {qoe} |".format(
                 grp=grp,
                 q=q,
                 stk=stk,
                 cc=cc,
                 n=len(grows),
                 thr=fmt_num(mean_valid(grows, "throughput_mbps")),
-                util=fmt_num(mean_valid(grows, "utilization"), 3),
                 qd=fmt_num(mean_valid(grows, "qdelay_avg_ms")),
-                pwr=fmt_num(mean_valid(grows, "util_power")),
                 drop=fmt_num(mean_valid(grows, "drop_rate"), 4),
                 rct=fmt_num(mean_valid(grows, "rct_mean_ms")),
+                rct95=fmt_num(mean_valid(grows, "rct_p95_ms")),
                 qoe=fmt_num(mean_valid(grows, "mortise_qoe")),
             )
         )
 
-    if len(records) <= 80:
-        lines.extend([
-            "",
-            "## Per-Run Details",
-            "",
-            "| Stack | Workload | Trace | Queue (B) | CC | Thr (Mbps) | Util | QDelay Avg (ms) | QDelay P95 (ms) | Power (Util/s) | Drop | Mean RCT (ms) | Mortise QoE |",
-            "|---|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
-        ])
-        for r in records:
-            lines.append(
-                "| {stack} | {workload} | {trace} | {q} | {cc} | {thr} | {util} | {qd} | {qdp95} | {pwr} | {drop} | {rct} | {qoe} |".format(
-                    stack=r.get("stack", "-"),
-                    workload=r.get("workload", "-"),
-                    trace=r.get("trace", "-"),
-                    q=r.get("queue_bytes", "-"),
-                    cc=r.get("cc", "-"),
-                    thr=fmt_num(r.get("throughput_mbps")),
-                    util=fmt_num(r.get("utilization"), 3),
-                    qd=fmt_num(r.get("qdelay_avg_ms")),
-                    qdp95=fmt_num(r.get("qdelay_p95_ms")),
-                    pwr=fmt_num(r.get("util_power")),
-                    drop=fmt_num(r.get("drop_rate"), 4),
-                    rct=fmt_num(r.get("rct_mean_ms")),
-                    qoe=fmt_num(r.get("mortise_qoe")),
-                )
-            )
     args.out_md.parent.mkdir(parents=True, exist_ok=True)
     args.out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Analyzed {len(records)} runs -> {args.out_csv}, {args.out_md}")

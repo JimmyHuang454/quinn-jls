@@ -63,7 +63,7 @@ jobs:
           mkdir -p /tmp/workloads
           curl -fsSL --retry 3 -o /tmp/workloads/app.wk \
             "https://raw.githubusercontent.com/BobAnkh/Mortise/main/mortise/workload/app.wk"
-          python3 -c 'print("\n".join(["0\t2097152"] * 15))' > /tmp/workloads/bulk.wk
+          python3 -c 'print("\n".join(["0\t2097152"] * 200))' > /tmp/workloads/bulk.wk
 
       - name: Run quinn-perf Mahimahi suite (${{ matrix.shard }})
         env:
@@ -190,13 +190,18 @@ jobs:
 
       - name: Run Mortise Mahimahi suite (${{ matrix.shard }})
         env:
+          MODE: ${{ github.event.inputs.mode }}
           SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
           OUT="/tmp/mortise_out"
           mkdir -p "$OUT" /tmp/workloads
           cp /tmp/Mortise/mortise/workload/app.wk /tmp/workloads/app.wk
-          python3 -c 'print("\n".join(["0\t2097152"] * 15))' > /tmp/workloads/bulk.wk
+          python3 -c 'print("\n".join(["0\t2097152"] * 200))' > /tmp/workloads/bulk.wk
+          BULK_SECS=45
+          if [ "$MODE" = "smoke" ]; then
+            BULK_SECS=30
+          fi
 
           RUNNER_SCRIPT="$PWD/scripts/run_mahimahi_suite.py"
           cd /tmp/Mortise/mortise
@@ -235,6 +240,7 @@ jobs:
             --ccs "$CCS" \
             --queues "150000,2000000" \
             --workloads "bulk,app" \
+            --bulk-secs "$BULK_SECS" \
             --parallel 4 \
             --bin ./target/release/client \
             --trace-dir /tmp/traces \
@@ -273,7 +279,8 @@ jobs:
             --input-dir /tmp/all_results \
             --out-csv /tmp/summary/comparison_summary.csv \
             --out-md /tmp/summary/comparison_summary.md \
-            --min-rtt-ms 20.0
+            --min-rtt-ms 20.0 \
+            --bulk-warmup-s 5.0
           cat /tmp/summary/comparison_summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload unified comparison summary

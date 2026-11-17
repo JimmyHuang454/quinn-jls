@@ -147,7 +147,11 @@ def prepare_trace_pair(trace_name: str, trace_dir: Path) -> tuple[Path, Path]:
     raise ValueError(f"Unknown trace: {trace_name}")
 
 
-def run_mm_cmd(mm_cmd: list[str], expected_out: Path) -> subprocess.CompletedProcess[str]:
+def run_mm_cmd(
+    mm_cmd: list[str],
+    expected_out: Path,
+    allow_timeout: bool = False,
+) -> subprocess.CompletedProcess[str]:
     """Launch mm-delay/mm-link with staggered startup and 1 retry on transient setup failure."""
     for attempt in range(2):
         with MM_LAUNCH_LOCK:
@@ -155,7 +159,8 @@ def run_mm_cmd(mm_cmd: list[str], expected_out: Path) -> subprocess.CompletedPro
             time.sleep(1.5)
         stdout, stderr = proc.communicate()
         res = subprocess.CompletedProcess(mm_cmd, proc.returncode, stdout, stderr)
-        if res.returncode == 0 and expected_out.exists():
+        ok_code = res.returncode == 0 or (allow_timeout and res.returncode in (124, 130))
+        if ok_code and expected_out.exists() and expected_out.stat().st_size > 0:
             return res
         if attempt == 0:
             time.sleep(2.0)
@@ -242,16 +247,23 @@ def run_mortise_job(
     workload_kind: str,
     workload_path: Path,
     out_dir: Path,
+    bulk_secs: int,
 ) -> tuple[str, int]:
     stem = f"mortise__{workload_kind}__{trace_name}__q{q_bytes}__{cc}"
     log_path = out_dir / f"{stem}.downlink.log"
     rct_path = out_dir / f"{stem}.rct.csv"
 
-    timeout_s = 150 if workload_kind == "bulk" else 220
-    client_cmd = (
-        f'timeout {timeout_s} "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
-        f'--congestion "{cc}" --workload "{workload_path}" --output "{rct_path}"'
-    )
+    if workload_kind == "bulk":
+        # Match quinn's fixed-duration bulk window using SIGINT after bulk_secs.
+        client_cmd = (
+            f'timeout -k 5 -s INT {bulk_secs} "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
+            f'--congestion "{cc}" --workload "{workload_path}" --output "{rct_path}"'
+        )
+    else:
+        client_cmd = (
+            f'timeout 220 "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
+            f'--congestion "{cc}" --workload "{workload_path}" --output "{rct_path}"'
+        )
     mm_cmd = [
         "mm-delay",
         "10",
@@ -268,10 +280,15 @@ def run_mortise_job(
         "-c",
         client_cmd,
     ]
-    res = run_mm_cmd(mm_cmd, rct_path)
-    if res.returncode != 0 or not rct_path.exists():
+    # For bulk runs, timeout exit code 124 is expected when stopping cleanly at bulk_secs.
+    expected = log_path if workload_kind == "bulk" else rct_path
+    allow_timeout = workload_kind == "bulk"
+    res = run_mm_cmd(mm_cmd, expected, allow_timeout=allow_timeout)
+    ok = (res.returncode == 0 or (allow_timeout and res.returncode in (124, 130))) and expected.exists()
+    if not ok:
         (out_dir / f"{stem}.err.log").write_text(res.stdout + "\n" + res.stderr, encoding="utf-8")
-    return stem, res.returncode
+        return stem, res.returncode or 1
+    return stem, 0
 
 
 def main() -> None:
@@ -319,7 +336,7 @@ def main() -> None:
         try:
             if args.stack == "quinn":
                 return run_quinn_job(slot, args.bin, cc, t, up_tr, down_tr, q, wk, wk_path, args.out_dir, args.bulk_secs)
-            return run_mortise_job(args.bin, cc, t, up_tr, down_tr, q, wk, wk_path, args.out_dir)
+            return run_mortise_job(args.bin, cc, t, up_tr, down_tr, q, wk, wk_path, args.out_dir, args.bulk_secs)
         finally:
             slot_pool.put(slot)
 

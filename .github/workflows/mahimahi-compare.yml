@@ -305,7 +305,7 @@ jobs:
 
           cat "$OUT/manager.log"
           if grep -q "Fail to load" "$OUT/manager.log" || ! grep -q "Load mortise_copa" "$OUT/manager.log"; then
-            echo "ERROR: mortise_copa BPF failed to load!"
+            echo "::error::mortise_copa BPF failed to load: $(tail -n 4 "$OUT/manager.log" | tr '\n' ' ')"
             exit 1
           fi
 

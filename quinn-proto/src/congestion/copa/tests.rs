@@ -716,10 +716,46 @@ fn app_idle_gap_reenters_slow_start_while_preserving_estimate() {
     assert!(!c.in_slow_start());
 
     // After an app-limited tail and >= 4 * srtt idle pause, slow start resumes while keeping delta
+    c.peak_bdp_window = (100 * MTU) as f64;
     t += Duration::from_secs(1) + ms(10);
     c.on_ack(t, t - ms(50), MTU, 11, SpaceId::Data, true, &rtt);
     c.on_sent(t + Duration::from_secs(1), MTU, 12);
     assert!(c.in_slow_start());
     assert_eq!(c.adaptive_estimate().unwrap().delta, Some(0.04));
-    assert!(c.window() >= CopaConfig::copa_auto().initial_window);
+    assert_eq!(c.window(), 60 * MTU);
+}
+
+#[test]
+fn slow_start_ignores_transient_jitter_spike_for_copa_auto() {
+    let epoch = Instant::now();
+    let t0 = epoch + Duration::from_secs(5);
+    let mut auto = CopaAutoConfig::default();
+    auto.probe_epoch(Some(epoch));
+    let mut cfg = CopaConfig::copa_auto_nc();
+    cfg.adaptive(Some(auto));
+    let mut c = Copa::new(Arc::new(cfg), t0, MTU as u16);
+    let rtt = rtt_estimator(ms(50));
+    ack(&mut c, t0, ms(50), &rtt);
+    c.window = (80 * MTU) as f64;
+
+    // A single 8 ms wireless jitter spike (< 15 ms guard) does not abort slow start on the first ACK
+    ack(&mut c, t0 + ms(30), ms(58), &rtt);
+    assert!(c.in_slow_start());
+
+    // Returning to baseline clears the confirmation timer and continues doubling
+    ack(&mut c, t0 + ms(60), ms(50), &rtt);
+    assert!(c.in_slow_start());
+    assert!(c.window() > 80 * MTU);
+
+    // A sustained mild queue over >= 1 SRTT confirms slow-start exit
+    ack(&mut c, t0 + ms(90), ms(58), &rtt);
+    assert!(c.in_slow_start());
+    ack(&mut c, t0 + ms(145), ms(58), &rtt);
+    assert!(!c.in_slow_start());
+
+    // Once app-limited traffic has been seen, RTT_min uses the 32 * srtt (1.6 s) window instead of 10 s
+    c.on_ack(t0 + ms(200), t0 + ms(160), MTU, 10, SpaceId::Data, true, &rtt);
+    assert_eq!(c.min_rtt(), Some(ms(40)));
+    ack(&mut c, t0 + ms(1900), ms(55), &rtt);
+    assert_eq!(c.min_rtt(), Some(ms(55)));
 }

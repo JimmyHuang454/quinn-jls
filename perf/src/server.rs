@@ -190,12 +190,18 @@ async fn respond(mut bytes: u64, mut stream: quinn::SendStream) -> Result<()> {
     static DATA: [u8; 1024 * 1024] = [42; 1024 * 1024];
 
     while bytes > 0 {
-        let chunk_len = bytes.min(DATA.len() as u64);
+        let mut chunks: [Bytes; 16] = std::array::from_fn(|_| Bytes::new());
+        let mut count = 0;
+        while bytes > 0 && count < chunks.len() {
+            let chunk_len = bytes.min(DATA.len() as u64);
+            chunks[count] = Bytes::from_static(&DATA[..chunk_len as usize]);
+            bytes -= chunk_len;
+            count += 1;
+        }
         stream
-            .write_chunk(Bytes::from_static(&DATA[..chunk_len as usize]))
+            .write_all_chunks(&mut chunks[..count])
             .await
             .context("sending response")?;
-        bytes -= chunk_len;
     }
     debug!("finished responding on {}", stream.id());
     Ok(())

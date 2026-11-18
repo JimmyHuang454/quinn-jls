@@ -101,6 +101,14 @@ pub struct Copa {
     last_time: Instant,
     /// Whether the last received ACK was marked `app_limited`
     last_ack_app_limited: bool,
+    /// Latest timestamp at which an `app_limited` ACK was observed
+    last_app_limited_time: Option<Instant>,
+    /// Start of a mild-queue `!increase` streak in slow start (anti-jitter exit confirmation)
+    slow_start_confirm_since: Option<Instant>,
+    /// BDP-matched fallback delta after exiting slow start before the first half-period completes
+    startup_delta: Option<f64>,
+    /// Recently observed BDP in bytes for BBR-style `RestartFromIdle` window anchoring
+    peak_bdp_window: f64,
     /// Saved window/RTT_min for legacy `delta_max` aligned probes (`gentle_probe == false`)
     legacy_probe: Option<LegacyProbeSaved>,
     /// Drains started and skipped (RTT_min was fresh)
@@ -148,6 +156,10 @@ impl Copa {
             drain: DrainController::new(),
             last_time: now,
             last_ack_app_limited: false,
+            last_app_limited_time: None,
+            slow_start_confirm_since: None,
+            startup_delta: None,
+            peak_bdp_window: 0.0,
             legacy_probe: None,
             #[cfg(test)]
             drains: (0, 0),
@@ -276,7 +288,14 @@ impl Copa {
             self.same_direction = 0;
         } else {
             self.same_direction += 1;
-            if self.same_direction >= 3 {
+            let fast_up = direction == Direction::Up
+                && self
+                    .auto
+                    .as_ref()
+                    .map(|a| a.estimate().dq_target)
+                    .is_some_and(|target| target > 0.0 && self.dq.as_secs_f64() < 0.5 * target);
+            let threshold = if fast_up { 1 } else { 3 };
+            if self.same_direction >= threshold {
                 self.velocity = self.velocity.saturating_mul(2);
             }
         }
@@ -490,9 +509,9 @@ impl Copa {
         // 1. Initial post-slow-start gentle jitter calibration (replaces multi-half-period lockup)
         if auto.wants_initial_gentle_measure(self.slow_start) {
             let rate = self.pacing_rate().map_or(0.0, |r| r as f64);
-            let max_dur = (8 * self.srtt).clamp(
-                Duration::from_millis(200),
-                Duration::from_millis(600),
+            let max_dur = (4 * self.srtt).clamp(
+                Duration::from_millis(120),
+                Duration::from_millis(350),
             );
             self.drain.start(
                 DrainKind::MeasureJitter,
@@ -638,12 +657,11 @@ impl Controller for Copa {
             && now.saturating_duration_since(prev_time) >= idle_thresh
         {
             // After an application-idle gap, re-enter ACK-clocked slow start (keeping learned
-            // delta/jitter estimates) so cwnd quickly rediscovers post-idle capacity.
+            // delta/jitter estimates) and anchor cwnd toward recent BDP like BBR RestartFromIdle.
             self.slow_start = true;
-            self.window = self
-                .window
-                .max(self.config.initial_window as f64)
-                .min(MAX_WINDOW);
+            self.slow_start_confirm_since = None;
+            let floor = (self.config.initial_window as f64).max(0.6 * self.peak_bdp_window);
+            self.window = self.window.max(floor).min(MAX_WINDOW);
             self.reset_velocity();
             self.last_nearly_empty = now;
         }
@@ -661,6 +679,9 @@ impl Controller for Copa {
     ) {
         self.last_time = self.last_time.max(now);
         self.last_ack_app_limited = app_limited;
+        if app_limited {
+            self.last_app_limited_time = Some(now);
+        }
         let sample = now.saturating_duration_since(sent);
         // The connection updates its RTT estimator after the congestion controller has seen the
         // acknowledged packets, so the very first samples fall back to the initial RTT
@@ -671,11 +692,22 @@ impl Controller for Copa {
             self.apply_drain_finished(now, finished, rtt_min);
         }
 
-        self.rtt_min.update(
-            now,
-            sample,
-            self.config.min_rtt_window.max(Duration::from_micros(1)),
-        );
+        // Intermittent / app-limited flows naturally drain the queue between bursts and use a
+        // responsive `32 * srtt` RTT_min window; continuously saturated bulk flows keep
+        // `min_rtt_window` (10 s) aligned with the 20 s multi-flow drain slots to avoid ratcheting.
+        let recent_app_limited = self
+            .last_app_limited_time
+            .is_some_and(|t| now.saturating_duration_since(t) <= self.config.min_rtt_window);
+        let min_rtt_win = if self.auto.is_some() && recent_app_limited {
+            (32 * srtt).clamp(
+                Duration::from_secs(1).min(self.config.min_rtt_window),
+                self.config.min_rtt_window,
+            )
+        } else {
+            self.config.min_rtt_window
+        };
+        self.rtt_min
+            .update(now, sample, min_rtt_win.max(Duration::from_micros(1)));
         self.rtt_standing
             .update(now, sample, (srtt / 2).max(Duration::from_micros(1)));
         self.rtt_max
@@ -707,9 +739,19 @@ impl Controller for Copa {
 
         let mss = self.current_mtu as f64;
         let acked_packets = bytes as f64 / mss;
+        if !app_limited
+            && let Some(bdp) = self.drain.estimated_bdp(now, srtt, rtt_min)
+        {
+            self.peak_bdp_window = (0.85 * self.peak_bdp_window).max(bdp);
+        }
         if !self.competitive {
             // The default mode uses the configured delta, or the one chosen by copa-auto
-            self.delta = self.config.delta;
+            let fallback_delta = if self.slow_start {
+                self.config.delta
+            } else {
+                self.startup_delta.unwrap_or(self.config.delta)
+            };
+            self.delta = fallback_delta;
             let excluded = self.drain.is_draining() || self.drain.is_recovering();
             if let Some(auto) = &mut self.auto {
                 self.drain.observe_sample(now, sample, dq, app_limited);
@@ -734,7 +776,7 @@ impl Controller for Copa {
                     },
                     self.delta,
                 );
-                self.delta = auto.delta(now, self.slow_start, self.config.delta);
+                self.delta = auto.delta(now, self.slow_start, fallback_delta);
                 if managed_probe {
                     self.legacy_probe = None;
                 } else {
@@ -796,6 +838,7 @@ impl Controller for Copa {
         }
 
         if increase {
+            self.slow_start_confirm_since = None;
             if self.slow_start {
                 // One packet per acknowledged packet: cwnd doubles per RTT, clocked by the ACKs
                 self.window += bytes as f64;
@@ -804,6 +847,24 @@ impl Controller for Copa {
                     / (self.delta * self.window_packets());
             }
         } else {
+            if self.slow_start && self.auto.is_some() {
+                let jitter_guard = rtt_min.mul_f64(0.25).max(Duration::from_millis(15));
+                if dq < jitter_guard {
+                    let since = *self.slow_start_confirm_since.get_or_insert(now);
+                    if now.saturating_duration_since(since) < srtt.max(Duration::from_millis(20)) {
+                        return;
+                    }
+                }
+                self.slow_start_confirm_since = None;
+                if self.startup_delta.is_none()
+                    && let Some(bdp) = self.drain.estimated_bdp(now, srtt, rtt_min)
+                {
+                    let bdp_pkts = bdp / mss;
+                    if bdp_pkts > 60.0 {
+                        self.startup_delta = Some((6.0 / bdp_pkts).clamp(0.005, self.config.delta));
+                    }
+                }
+            }
             self.slow_start = false;
             let step =
                 acked_packets * mss * self.velocity as f64 / (self.delta * self.window_packets());
@@ -834,6 +895,8 @@ impl Controller for Copa {
             self.drain.abort();
             self.window = self.minimum_window();
             self.slow_start = true;
+            self.slow_start_confirm_since = None;
+            self.peak_bdp_window = 0.0;
             self.reset_velocity();
             return;
         }

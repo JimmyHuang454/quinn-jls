@@ -722,6 +722,27 @@ impl AutoDelta {
         }
         self.rounds += 1;
         if !self.rounds.is_multiple_of(half_rounds) || settling {
+            // Mid-period capacity surge: if >= 3 active rounds show queueing far below the
+            // established target (< 35% of dq_target), flush an early delta update immediately.
+            if !settling
+                && self.settle_halves == 0
+                && !probe
+                && !s.competitive
+                && !self.seg_probe
+                && self.seg_rounds >= 3
+                && self.seg.acks >= 6
+                && self.seg.max_gap < srtt.max(0.05)
+                && self.est.dq_target > 0.0
+                && let Some(j) = self.est.jitter
+            {
+                let seg_dq = self.seg.dq_sum / self.seg.acks as f64;
+                if seg_dq < 0.35 * self.est.dq_target {
+                    self.apply_segment_update(s, seg_dq, j, delta);
+                    self.reset_segment();
+                    self.rounds -= self.rounds % half_rounds;
+                    self.post_idle = true;
+                }
+            }
             return;
         }
 

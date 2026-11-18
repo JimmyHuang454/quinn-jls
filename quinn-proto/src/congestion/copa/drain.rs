@@ -455,12 +455,13 @@ impl DrainController {
             if back_to_baseline || plateau_converged {
                 d.idle_reached_at = Some(now);
                 if d.kind == DrainKind::MeasureJitter && !d.hold_full_deadline {
-                    // Sample jitter floor over a short clean post-idle window (~5 SRTT, within
-                    // the remaining slot budget) rather than stalling for 2 s.
-                    let sample_len = (5 * srtt).clamp(
-                        Duration::from_millis(100),
-                        Duration::from_millis(600),
-                    );
+                    // Sample jitter floor over a short clean post-idle window rather than
+                    // stalling for 2 s (even shorter for initial post-slow-start calibration).
+                    let sample_len = if d.slot.is_none() {
+                        (2 * srtt).clamp(Duration::from_millis(60), Duration::from_millis(200))
+                    } else {
+                        (5 * srtt).clamp(Duration::from_millis(100), Duration::from_millis(600))
+                    };
                     d.measure_until = Some((now + sample_len).min(d.deadline));
                 }
             }

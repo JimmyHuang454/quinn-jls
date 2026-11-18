@@ -7,16 +7,19 @@ on:
       - .github/workflows/mahimahi-compare.yml
       - scripts/install_mahimahi.sh
       - scripts/mahimahi_eval.py
+      - scripts/mahimahi_rct.py
       - scripts/run_mahimahi_suite.py
+      - perf/src/client.rs
   workflow_dispatch:
     inputs:
       mode:
-        description: "Quick is the small LTE comparison. Dataset check runs bulk across the three new datasets."
+        description: "Quick checks LTE; rct compares download tail latency on LTE at 2 MB; datasets checks new bulk traces."
         required: true
         default: "quick"
         type: choice
         options:
           - quick
+          - rct
           - smoke
           - full
           - nyc-subway
@@ -52,11 +55,12 @@ jobs:
   plan:
     runs-on: ubuntu-24.04
     outputs:
+      mode: ${{ steps.matrix.outputs.mode }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - id: matrix
         env:
-          MODE: ${{ inputs.mode || 'datasets' }}
+          MODE: ${{ inputs.mode || (github.ref_name == 'codex/mahimahi-rct' && 'rct') || 'datasets' }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
@@ -64,16 +68,21 @@ jobs:
           mode = os.environ['MODE']
           shards = {
               'quick': ['smoke'],
+              'rct': ['smoke'],
               'full': ['lte', 'nyc-stat', 'nyc-walk-1', 'nyc-walk-2', 'nyc-walk-3',
                        'nyc-drive-1', 'nyc-drive-2', 'synth', 'nyc-subway', 'lumos-5g'],
               'datasets': ['nyc-subway', 'lumos-5g', 'leo'],
           }.get(mode, [mode])
           include = []
           for shard in shards:
-              workloads = ['bulk'] if mode == 'datasets' or shard == 'leo' else ['bulk', 'app']
+              if mode == 'rct':
+                  workloads = ['app']
+              else:
+                  workloads = ['bulk'] if mode == 'datasets' or shard == 'leo' else ['bulk', 'app']
               for workload in workloads:
                   include.append({'shard': shard, 'workload': workload})
           print('matrix=' + json.dumps({'include': include}))
+          print('mode=' + mode)
           PY
 
   quinn-eval:
@@ -115,7 +124,7 @@ jobs:
 
       - name: Run quinn-perf Mahimahi suite (${{ matrix.shard }})
         env:
-          MODE: ${{ inputs.mode || 'datasets' }}
+          MODE: ${{ needs.plan.outputs.mode }}
           THETA: ${{ inputs.theta || '0.98' }}
           SHARD: ${{ matrix.shard }}
           WORKLOAD: ${{ matrix.workload }}
@@ -123,6 +132,7 @@ jobs:
           STREAM_RECEIVE_WINDOW: ${{ inputs.stream_receive_window || '8M' }}
         run: |
           BULK_SECS=45
+          APP_SECS=200
           CCS="copa-auto,copa-auto-nc,copa-auto-theta${THETA},copa-auto-nc-theta${THETA},copa,bbr1,cubic"
           QUEUES="150000,2000000"
           PARALLEL=4
@@ -130,6 +140,12 @@ jobs:
           if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then
             CCS="copa,copa-auto,copa-auto-theta${THETA}"
             QUEUES="150000"
+          fi
+          if [ "$MODE" = "rct" ]; then
+            CCS="copa-auto,copa-auto-theta0.9,copa-auto-theta0.98"
+            QUEUES="2000000"
+            APP_SECS=260
+            export RUST_LOG="warn,quinn_proto::congestion::copa=debug"
           fi
           EXTRA_ARGS=()
           if [ "$SHARD" = "lumos-5g" ]; then
@@ -155,6 +171,7 @@ jobs:
             --queues "$QUEUES" \
             --workloads "$WORKLOAD" \
             --bulk-secs "$BULK_SECS" \
+            --app-secs "$APP_SECS" \
             --send-fairness "$SEND_FAIRNESS" \
             "${EXTRA_ARGS[@]}" \
             --parallel "$PARALLEL" \
@@ -261,7 +278,7 @@ jobs:
 
       - name: Run Mortise Mahimahi suite (${{ matrix.shard }})
         env:
-          MODE: ${{ inputs.mode || 'datasets' }}
+          MODE: ${{ needs.plan.outputs.mode }}
           SHARD: ${{ matrix.shard }}
           WORKLOAD: ${{ matrix.workload }}
         run: |
@@ -271,10 +288,15 @@ jobs:
           cp /tmp/Mortise/mortise/workload/app.wk /tmp/workloads/app.wk
           python3 -c 'print("0\t2097152\n" * 8192, end="")' > /tmp/workloads/bulk.wk
           BULK_SECS=45
+          APP_SECS=200
           QUEUES="150000,2000000"
           PARALLEL=4
           if [ "$SHARD" = "smoke" ]; then BULK_SECS=30; fi
           if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then QUEUES="150000"; fi
+          if [ "$MODE" = "rct" ]; then
+            QUEUES="2000000"
+            APP_SECS=260
+          fi
           if [ "$SHARD" = "lumos-5g" ]; then
             QUEUES="2000000,16000000"
             PARALLEL=2
@@ -314,7 +336,7 @@ jobs:
           sleep 2
 
           CCS="mortise_copa,bbr,cubic"
-          if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then
+          if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ] || [ "$MODE" = "rct" ]; then
             CCS="mortise_copa"
           elif [ "${COPA_KMOD:-0}" = "1" ]; then
             CCS="${CCS},copa"
@@ -327,6 +349,7 @@ jobs:
             --queues "$QUEUES" \
             --workloads "$WORKLOAD" \
             --bulk-secs "$BULK_SECS" \
+            --app-secs "$APP_SECS" \
             --parallel "$PARALLEL" \
             --bin ./target/release/client \
             --trace-dir /tmp/traces \
@@ -346,7 +369,7 @@ jobs:
 
   summarize:
     name: Unified Comparison Summary
-    needs: [quinn-eval, mortise-eval]
+    needs: [plan, quinn-eval, mortise-eval]
     if: ${{ !cancelled() && (needs.quinn-eval.result != 'skipped' || needs.mortise-eval.result != 'skipped') }}
     runs-on: ubuntu-24.04
     steps:
@@ -360,6 +383,8 @@ jobs:
           path: /tmp/all_results
 
       - name: Analyze and write summary
+        env:
+          MODE: ${{ needs.plan.outputs.mode }}
         run: |
           mkdir -p /tmp/summary
           python3 scripts/mahimahi_eval.py \
@@ -369,6 +394,10 @@ jobs:
             --min-rtt-ms 20.0 \
             --bulk-warmup-s 5.0
           cat /tmp/summary/comparison_summary.md >> "$GITHUB_STEP_SUMMARY"
+          EXTRA_ARGS=()
+          if [ "$MODE" = "rct" ]; then EXTRA_ARGS+=(--print-summary); fi
+          python3 scripts/mahimahi_rct.py --input-dir /tmp/all_results --out-dir /tmp/summary \
+            "${EXTRA_ARGS[@]}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload unified comparison summary
         uses: actions/upload-artifact@v4

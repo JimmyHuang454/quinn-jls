@@ -1,10 +1,8 @@
-#[cfg(feature = "json-output")]
-use std::path::PathBuf;
 use std::{
     fs,
     io::{BufWriter, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -68,6 +66,9 @@ pub struct Opt {
     /// Output CSV path for per-request RCT records (`id,size,client_send,server_recv,client_recv,rct`)
     #[clap(long)]
     rct_csv: Option<PathBuf>,
+    /// Output one timing record per scheduled workload request, including incomplete requests
+    #[clap(long, requires = "workload")]
+    request_timings_csv: Option<PathBuf>,
     /// Output JSON path for connection-level path statistics
     #[cfg(feature = "json-output")]
     #[clap(long)]
@@ -161,15 +162,31 @@ pub async fn run(opt: Opt) -> Result<()> {
         None => None,
     };
     let is_workload = workload_items.is_some();
-    let rct_records = Arc::new(Mutex::new(Vec::<RctRecord>::new()));
     let run_start = Instant::now();
+    let run_epoch_ns = now_epoch_ns();
+    let mut scheduled = Duration::ZERO;
+    let rct_records = Arc::new(Mutex::new(
+        workload_items
+            .iter()
+            .flatten()
+            .map(|&(gap, size)| {
+                scheduled += gap;
+                RctRecord {
+                    size,
+                    scheduled,
+                    ..RctRecord::default()
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
 
     let drive_fut = async {
         if let Some(items) = workload_items {
             drive_workload(
                 connection.clone(),
                 stream_stats.clone(),
-                items,
+                &items,
+                run_start,
                 rct_records.clone(),
             )
             .await
@@ -220,41 +237,44 @@ pub async fn run(opt: Opt) -> Result<()> {
         }
     };
 
-    tokio::select! {
+    let close_reason: &[u8] = tokio::select! {
         res = drive_fut => {
             if let Err(e) = res {
                 error!("drive failed: {:#}", e);
             }
             if is_workload {
                 info!("workload finished, shutting down");
-                connection.close(0u32.into(), b"done");
             }
+            b"done"
         }
-        _ = stats_fut => {}
+        _ = stats_fut => b"done",
         _ = tokio::signal::ctrl_c() => {
             info!("shutting down");
-            connection.close(0u32.into(), b"interrupted");
+            b"interrupted"
         }
         // Add a small duration so the final interval can be reported
         _ = tokio::time::sleep(Duration::from_secs(opt.duration) + Duration::from_millis(200)) => {
             info!("shutting down");
-            connection.close(0u32.into(), b"done");
+            b"done"
         }
-    }
+    };
 
     let final_stats = connection.stats();
     let elapsed_s = run_start.elapsed().as_secs_f64();
+    let records = rct_records.lock().unwrap().clone();
+    connection.close(0u32.into(), close_reason);
     endpoint.wait_idle().await;
 
     if let Some(path) = &opt.rct_csv {
-        let mut records = rct_records.lock().unwrap().clone();
-        records.sort_by_key(|r| r.id);
-        write_rct_csv(path, &records, final_stats.path.lost_packets)?;
+        write_rct_csv(path, &records, run_epoch_ns, final_stats.path.lost_packets)?;
+    }
+    if let Some(path) = &opt.request_timings_csv {
+        write_request_timings_csv(path, &records)?;
     }
 
     #[cfg(feature = "json-output")]
     if let Some(path) = &opt.summary_json {
-        let completed = rct_records.lock().unwrap().len();
+        let completed = records.iter().filter(|r| r.completed.is_some()).count();
         write_summary_json(path, &final_stats, elapsed_s, completed)?;
     }
 
@@ -270,9 +290,10 @@ async fn drain_stream(
     mut stream: quinn::RecvStream,
     download: u64,
     stream_stats: OpenStreamStats,
-) -> Result<()> {
+    on_first_byte: impl FnOnce(),
+) -> Result<u64> {
     if download == 0 {
-        return Ok(());
+        return Ok(0);
     }
 
     #[rustfmt::skip]
@@ -289,24 +310,26 @@ async fn drain_stream(
     let download_start = Instant::now();
     let recv_stream_stats = stream_stats.new_receiver(&stream, download);
 
-    let mut first_byte = true;
+    let mut on_first_byte = Some(on_first_byte);
+    let mut received = 0;
 
     while let Some(size) = stream.read_chunks(&mut bufs[..]).await? {
-        if first_byte {
+        if let Some(on_first_byte) = on_first_byte.take() {
             recv_stream_stats.on_first_byte(download_start.elapsed());
-            first_byte = false;
+            on_first_byte();
         }
         let bytes_received = bufs[..size].iter().map(|b| b.len()).sum();
         recv_stream_stats.on_bytes(bytes_received);
+        received += bytes_received as u64;
     }
 
-    if first_byte {
+    if on_first_byte.is_some() {
         recv_stream_stats.on_first_byte(download_start.elapsed());
     }
     recv_stream_stats.finish(download_start.elapsed());
 
     debug!("response finished on {}", stream.id());
-    Ok(())
+    Ok(received)
 }
 
 async fn drive_uni(
@@ -348,7 +371,7 @@ async fn request_uni(
 ) -> Result<()> {
     request(send, upload, download, stream_stats.clone()).await?;
     let recv = conn.accept_uni().await?;
-    drain_stream(recv, download, stream_stats).await?;
+    drain_stream(recv, download, stream_stats, || {}).await?;
     Ok(())
 }
 
@@ -422,7 +445,7 @@ async fn request_bi(
     stream_stats: OpenStreamStats,
 ) -> Result<()> {
     request(send, upload, download, stream_stats.clone()).await?;
-    drain_stream(recv, download, stream_stats).await?;
+    drain_stream(recv, download, stream_stats, || {}).await?;
     Ok(())
 }
 
@@ -480,13 +503,14 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct RctRecord {
-    id: usize,
     size: u64,
-    client_send_ns: u128,
-    client_recv_ns: u128,
-    rct_ms: u64,
+    scheduled: Duration,
+    started: Option<Duration>,
+    first_byte: Option<Duration>,
+    completed: Option<Duration>,
+    failed: bool,
 }
 
 fn parse_workload_str(content: &str) -> Result<Vec<(Duration, u64)>> {
@@ -526,41 +550,49 @@ fn now_epoch_ns() -> u128 {
 async fn drive_workload(
     connection: quinn::Connection,
     stream_stats: OpenStreamStats,
-    items: Vec<(Duration, u64)>,
+    items: &[(Duration, u64)],
+    run_start: Instant,
     rct_records: Arc<Mutex<Vec<RctRecord>>>,
 ) -> Result<()> {
-    let mut scheduled = Instant::now();
+    let mut scheduled = run_start;
     let mut tasks = JoinSet::new();
 
-    for (idx, (gap, size)) in items.into_iter().enumerate() {
+    for (idx, &(gap, size)) in items.iter().enumerate() {
         if !gap.is_zero() {
             scheduled += gap;
             tokio::time::sleep_until(scheduled.into()).await;
         }
-        let id = idx + 1;
         let conn = connection.clone();
         let stream_stats = stream_stats.clone();
         let rct_records = rct_records.clone();
         tasks.spawn(async move {
-            let client_send_ns = now_epoch_ns();
-            let req_start = Instant::now();
-            let (send, recv) = conn.open_bi().await?;
-            request_bi(send, recv, 0, size, stream_stats).await?;
-            let rct_ms = req_start.elapsed().as_millis() as u64;
-            let client_recv_ns = now_epoch_ns();
-            rct_records.lock().unwrap().push(RctRecord {
-                id,
-                size,
-                client_send_ns,
-                client_recv_ns,
-                rct_ms,
-            });
-            Ok::<(), anyhow::Error>(())
+            rct_records.lock().unwrap()[idx].started = Some(run_start.elapsed());
+            let result = async {
+                let (send, recv) = conn.open_bi().await?;
+                request(send, 0, size, stream_stats.clone()).await?;
+                let received = drain_stream(recv, size, stream_stats, || {
+                    rct_records.lock().unwrap()[idx].first_byte = Some(run_start.elapsed());
+                })
+                .await?;
+                anyhow::ensure!(
+                    received == size,
+                    "expected {size} bytes, received {received}"
+                );
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            let mut records = rct_records.lock().unwrap();
+            if let Err(err) = result {
+                records[idx].failed = true;
+                error!(id = idx + 1, "workload request failed: {err:#}");
+            } else {
+                records[idx].completed = Some(run_start.elapsed());
+            }
         });
     }
 
     while let Some(res) = tasks.join_next().await {
-        res.context("workload request task panicked")??;
+        res.context("workload request task panicked")?;
     }
 
     Ok(())
@@ -575,19 +607,70 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_rct_csv(path: &Path, records: &[RctRecord], lost_packets: u64) -> Result<()> {
+fn write_rct_csv(
+    path: &Path,
+    records: &[RctRecord],
+    epoch_ns: u128,
+    lost_packets: u64,
+) -> Result<()> {
     ensure_parent_dir(path)?;
     let file = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     let mut w = BufWriter::new(file);
     writeln!(w, "id,size,client_send,server_recv,client_recv,rct")?;
-    for r in records {
-        writeln!(
-            w,
-            "{},{},{},0,{},{}",
-            r.id, r.size, r.client_send_ns, r.client_recv_ns, r.rct_ms
-        )?;
+    for (idx, r) in records.iter().enumerate() {
+        if let (Some(start), Some(end)) = (r.started, r.completed) {
+            writeln!(
+                w,
+                "{},{},{},0,{},{}",
+                idx + 1,
+                r.size,
+                epoch_ns + start.as_nanos(),
+                epoch_ns + end.as_nanos(),
+                (end - start).as_millis()
+            )?;
+        }
     }
     writeln!(w, "0,0,0,{lost_packets},0,0")?;
+    w.flush()?;
+    Ok(())
+}
+
+fn write_request_timings_csv(path: &Path, records: &[RctRecord]) -> Result<()> {
+    fn timestamp(value: Option<Duration>) -> String {
+        value
+            .map(|time| time.as_micros().to_string())
+            .unwrap_or_default()
+    }
+
+    ensure_parent_dir(path)?;
+    let file = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut w = BufWriter::new(file);
+    writeln!(
+        w,
+        "id,size,status,scheduled_us,started_us,first_byte_us,completed_us"
+    )?;
+    for (idx, r) in records.iter().enumerate() {
+        let status = if r.completed.is_some() {
+            "completed"
+        } else if r.failed {
+            "failed"
+        } else if r.started.is_some() {
+            "incomplete"
+        } else {
+            "not_started"
+        };
+        writeln!(
+            w,
+            "{},{},{},{},{},{},{}",
+            idx + 1,
+            r.size,
+            status,
+            r.scheduled.as_micros(),
+            timestamp(r.started),
+            timestamp(r.first_byte),
+            timestamp(r.completed)
+        )?;
+    }
     w.flush()?;
     Ok(())
 }

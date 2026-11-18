@@ -8,6 +8,7 @@ import concurrent.futures
 import queue
 import random
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -310,6 +311,7 @@ def run_quinn_job(
     workload_path: Path,
     out_dir: Path,
     bulk_secs: int,
+    app_secs: int,
     send_fairness: str,
     stream_receive_window: str | None,
     connection_window: str | None,
@@ -363,10 +365,11 @@ def run_quinn_job(
             )
         else:
             rct_path = out_dir / f"{stem}.rct.csv"
+            timing_path = out_dir / f"{stem}.request-timings.csv"
             client_cmd = (
-                f'timeout 220 "{bin_path}" client "${{MAHIMAHI_BASE}}:{port}" '
+                f'timeout {app_secs + 20} "{bin_path}" client "${{MAHIMAHI_BASE}}:{port}" '
                 f'{common_cli} '
-                f'--workload "{workload_path}" --duration 200 '
+                f'--workload "{workload_path}" --duration {app_secs} --request-timings-csv "{timing_path}" '
                 f'--rct-csv "{rct_path}" --summary-json "{sum_path}"'
             )
 
@@ -393,6 +396,7 @@ def run_mortise_job(
     workload_path: Path,
     out_dir: Path,
     bulk_secs: int,
+    app_secs: int,
 ) -> tuple[str, int]:
     stem = f"mortise__{workload_kind}__{trace_name}__q{q_bytes}__{cc}"
     log_path = out_dir / f"{stem}.downlink.log"
@@ -407,7 +411,7 @@ def run_mortise_job(
         )
     else:
         client_cmd = (
-            f'timeout 220 "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
+            f'timeout {app_secs + 20} "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
             f'--congestion "{cc}" --workload "{workload_path}" --output "{rct_path}"'
         )
     # For bulk runs, timeout exit code 124 is expected when stopping cleanly at bulk_secs.
@@ -430,6 +434,7 @@ def main() -> int:
     parser.add_argument("--queues", default="150000,2000000", help="Comma-separated queue sizes in bytes")
     parser.add_argument("--workloads", default="bulk,app", help="Comma-separated workloads (bulk,app)")
     parser.add_argument("--bulk-secs", type=int, default=45)
+    parser.add_argument("--app-secs", type=int, default=200, help="Application observation window in seconds")
     parser.add_argument("--send-fairness", choices=["true", "false"], default="true")
     parser.add_argument("--stream-receive-window", default=None, help="Optional quinn --stream-receive-window (e.g. 8M)")
     parser.add_argument("--connection-window", help="Quinn connection receive and send windows (e.g. 64M)")
@@ -446,6 +451,10 @@ def main() -> int:
     ccs = [c.strip() for c in args.ccs.split(",") if c.strip()]
     queues = [q.strip() for q in args.queues.split(",") if q.strip()]
     workloads = [w.strip() for w in args.workloads.split(",") if w.strip()]
+    if "app" in workloads:
+        manifest = args.out_dir / "app.wk"
+        if args.app_workload.resolve() != manifest.resolve():
+            shutil.copyfile(args.app_workload, manifest)
 
     replays = {t: prepare_replay(t, args.trace_dir, args.bulk_secs) for t in traces}
     for trace, replay in replays.items():
@@ -470,6 +479,9 @@ def main() -> int:
         cc, t, q, wk, wk_path = item
         slot = slot_pool.get()
         try:
+            if wk == "app":
+                stem = f"{args.stack}__app__{t}__q{q}__{cc}"
+                (args.out_dir / f"{stem}.app-seconds").write_text(f"{args.app_secs}\n", encoding="utf-8")
             if args.stack == "quinn":
                 return run_quinn_job(
                     slot,
@@ -482,11 +494,12 @@ def main() -> int:
                     wk_path,
                     args.out_dir,
                     args.bulk_secs,
+                    args.app_secs,
                     args.send_fairness,
                     args.stream_receive_window or None,
                     args.connection_window,
                 )
-            return run_mortise_job(args.bin, cc, t, replays[t], q, wk, wk_path, args.out_dir, args.bulk_secs)
+            return run_mortise_job(args.bin, cc, t, replays[t], q, wk, wk_path, args.out_dir, args.bulk_secs, args.app_secs)
         finally:
             slot_pool.put(slot)
 

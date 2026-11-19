@@ -323,7 +323,7 @@ def run_mm_cmd(
             time.sleep(1.5)
         stdout, stderr = proc.communicate()
         res = subprocess.CompletedProcess(mm_cmd, proc.returncode, stdout, stderr)
-        ok_code = res.returncode == 0 or (allow_timeout and res.returncode in (124, 130))
+        ok_code = res.returncode == 0 or (allow_timeout and res.returncode in (124, 130, 137, 143))
         if ok_code and expected_out.exists() and expected_out.stat().st_size > 0:
             return res
         # Once packet service started, a retry would rerun the experiment and could overwrite results.
@@ -509,21 +509,22 @@ def run_mortise_job(
 
     if workload_kind == "bulk":
         # Bulk only needs the link log. Terminate at the deadline without waiting for an RCT report.
+        # GNU timeout returns 124 on SIGTERM/SIGINT and 137 if -k 5 escalates to SIGKILL.
         client_cmd = (
             f'timeout -k 5 {bulk_secs} "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
             f'--congestion "{kernel_cc}" --workload "{workload_path}" --output "{rct_path}"; '
-            'status=$?; if [ "$status" -eq 124 ]; then exit 0; fi; exit "$status"'
+            'status=$?; if [ "$status" -eq 124 ] || [ "$status" -eq 130 ] || [ "$status" -eq 137 ] || [ "$status" -eq 143 ]; then exit 0; fi; exit "$status"'
         )
     else:
         client_cmd = (
             f'timeout {app_secs + 20} "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
             f'--congestion "{kernel_cc}" --workload "{workload_path}" --output "{rct_path}"'
         )
-    # For bulk runs, timeout exit code 124 is expected when stopping cleanly at bulk_secs.
+    # For bulk runs, timeout exit codes (124/130/137/143) are expected when stopping at bulk_secs.
     expected = log_path if workload_kind == "bulk" else rct_path
     allow_timeout = workload_kind == "bulk"
     res = run_mm_cmd(replay_command(replay, q_bytes, log_path, client_cmd), expected, log_path, allow_timeout=allow_timeout)
-    ok_code = res.returncode == 0 or (allow_timeout and res.returncode in (124, 130))
+    ok_code = res.returncode == 0 or (allow_timeout and res.returncode in (124, 130, 137, 143))
     ok = ok_code and expected.exists() and has_deliveries(log_path)
     if not ok:
         record_failure(out_dir / f"{stem}.err.log", res)

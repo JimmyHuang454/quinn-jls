@@ -333,6 +333,51 @@ jobs:
           PY
           make build/mortise_copa.bpf.o
           cd /tmp/Mortise/mortise
+          python3 - << 'PY'
+          import pathlib
+
+          p = pathlib.Path("mortise-common/src/congestion.rs")
+          src = p.read_text()
+          extra_variants = [
+              ("CopaAuto", "copa_auto"),
+              ("CopaAutoNc", "copa_auto_nc"),
+              ("CopaAutoT90", "copa_auto_t90"),
+              ("CopaAutoT98", "copa_auto_t98"),
+              ("CopaAutoT", "copa_auto_t"),
+              ("CopaOrig", "copa_orig"),
+              ("Cdg", "cdg"),
+              ("Westwood", "westwood"),
+              ("Hybla", "hybla"),
+              ("Reno", "reno"),
+          ]
+          enum_add = "".join(f'    #[value(name = "{name}")]\n    {var},\n' for var, name in extra_variants)
+          disp_add = "".join(f'            CongestionOpt::{var} => write!(f, "{name}"),\n' for var, name in extra_variants)
+          ca_add = "".join(f'            CongestionOpt::{var} => (0, b"{name}"),\n' for var, name in extra_variants)
+          load_add = "".join(
+              f'            CongestionOpt::{var} => ManagerOperation::Load {{ path: "".to_string(), option: None }},\n'
+              for var, _ in extra_variants
+          )
+
+          assert "    Bbr,\n}" in src, "expected enum CongestionOpt end"
+          src = src.replace("    Bbr,\n}", f"    Bbr,\n{enum_add}}}", 1)
+          assert 'CongestionOpt::Bbr => write!(f, "bbr"),\n' in src, "expected Display end"
+          src = src.replace(
+              'CongestionOpt::Bbr => write!(f, "bbr"),\n',
+              f'CongestionOpt::Bbr => write!(f, "bbr"),\n{disp_add}',
+              1,
+          )
+          assert 'CongestionOpt::Bbr => (0, b"bbr"),\n' in src, "expected get_tcp_ca end"
+          src = src.replace(
+              'CongestionOpt::Bbr => (0, b"bbr"),\n',
+              f'CongestionOpt::Bbr => (0, b"bbr"),\n{ca_add}',
+              1,
+          )
+          marker = '            CongestionOpt::Vegas => ManagerOperation::Load {\n                path: "".to_string(),\n                option: None,\n            },\n'
+          assert marker in src, "expected get_load_option end"
+          src = src.replace(marker, marker + load_add, 1)
+          p.write_text(src)
+          print("Patched mortise-common/src/congestion.rs with copa_auto* + extra kernel CCs")
+          PY
           cargo build --release -p mortise-manager -p traffic
 
           cd /tmp/Mortise/algorithm/kern-mod

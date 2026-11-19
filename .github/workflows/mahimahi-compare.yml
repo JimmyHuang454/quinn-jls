@@ -169,7 +169,7 @@ jobs:
           STREAM_RECEIVE_WINDOW: ${{ inputs.stream_receive_window || '8M' }}
         run: |
           BULK_SECS=45
-          APP_SECS=200
+          APP_SECS=300
           FIRST_THETA="${THETA%%,*}"
           FIRST_THETA="${FIRST_THETA// /}"
           THETA_CCS=""
@@ -189,7 +189,7 @@ jobs:
           if [ "$MODE" = "rct" ]; then
             CCS="copa-auto,copa-auto-theta0.9,copa-auto-theta0.98"
             QUEUES="2000000"
-            APP_SECS=260
+            APP_SECS=300
             export RUST_LOG="warn,quinn_proto::congestion::copa=debug"
           fi
           if [ "$MODE" = "rct-datasets" ]; then
@@ -404,14 +404,14 @@ jobs:
           python3 scripts/gen_workloads.py --out-dir /tmp/workloads
           python3 -c 'print("0\t2097152\n" * 8192, end="")' > /tmp/workloads/bulk.wk
           BULK_SECS=45
-          APP_SECS=200
+          APP_SECS=300
           QUEUES="150000,2000000"
           PARALLEL=4
           if [ "$SHARD" = "smoke" ]; then BULK_SECS=30; fi
           if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then QUEUES="150000"; fi
           if [ "$MODE" = "rct" ]; then
             QUEUES="2000000"
-            APP_SECS=260
+            APP_SECS=300
           fi
           if [ "$MODE" = "rct-datasets" ]; then
             QUEUES="2000000"

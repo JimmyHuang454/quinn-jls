@@ -594,7 +594,7 @@ def main() -> int:
         if args.app_secs > 0:
             obs_secs = args.app_secs
         else:
-            obs_secs = max(120, int(math.ceil(workload_span_secs(wk_path))) + 60)
+            obs_secs = max(180, int(math.ceil(workload_span_secs(wk_path))) + 150)
         workloads.append((wk_label, wk_path, obs_secs))
 
     base_replays = {t: prepare_replay(t, args.trace_dir, args.bulk_secs) for t in traces}

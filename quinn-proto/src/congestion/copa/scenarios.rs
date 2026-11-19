@@ -7,7 +7,7 @@
 
 use super::sim::*;
 use super::*;
-use crate::congestion::NewRenoConfig;
+use crate::congestion::{BbrConfig, CubicConfig, NewRenoConfig};
 
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
@@ -765,6 +765,485 @@ fn starlink_downlink_diagnostic() {
                     r.copa_delta[0],
                     norm_pwr,
                     r.jain(0..n),
+                );
+            }
+        }
+    }
+}
+
+fn load_mahimahi_pkt_trace(path: &str, base_rtt: Duration, buffer: u64, duration_s: u64) -> Link {
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read trace {path}: {e}"));
+    let mut stamps_ms: Vec<u64> = content
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .collect();
+    assert!(!stamps_ms.is_empty(), "empty trace {path}");
+    stamps_ms.sort_unstable();
+    let trace_dur_ms = (*stamps_ms.last().unwrap()).max(1);
+    let bin_ms = 50u64;
+    let total_ms = duration_s * 1000;
+    let num_bins = (total_ms / bin_ms) as usize;
+    let mut bins = vec![0u64; num_bins];
+    let wraps = (total_ms / trace_dur_ms) + 2;
+    for w in 0..wraps {
+        let base = w * trace_dur_ms;
+        if base >= total_ms {
+            break;
+        }
+        for &ts in &stamps_ms {
+            let t = base + ts;
+            if t >= total_ms {
+                break;
+            }
+            bins[(t / bin_ms) as usize] += 1;
+        }
+    }
+    let mut link = Link::new(12.0, base_rtt);
+    link.buffer = buffer;
+    link.rate.clear();
+    for (idx, &pkts) in bins.iter().enumerate() {
+        // 1500 bytes = 12000 bits per delivery opportunity
+        let bps = (pkts as f64 * 12_000.0) / (bin_ms as f64 * 1e-3);
+        link.rate.push((ms(idx as u64 * bin_ms), bps));
+    }
+    link
+}
+
+fn load_lumos5g_trace(path: &str, base_rtt: Duration, buffer: u64, duration_s: u64) -> Link {
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read Lumos5G trace {path}: {e}"));
+    let mut samples: Vec<(f64, f64)> = Vec::new();
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(t), Some(mbps)) = (
+            parts.next().and_then(|s| s.parse::<f64>().ok()),
+            parts.next().and_then(|s| s.parse::<f64>().ok()),
+        ) {
+            samples.push((t, mbps));
+        }
+    }
+    assert!(!samples.is_empty(), "empty Lumos5G trace {path}");
+    let span = samples.last().unwrap().0.max(1.0);
+    let mut link = Link::new(40.0, base_rtt);
+    link.buffer = buffer;
+    link.rate.clear();
+    let wraps = (duration_s as f64 / span).ceil() as usize + 1;
+    let mut prev_t = 0.0;
+    for w in 0..wraps {
+        let offset = w as f64 * span;
+        prev_t = offset;
+        for &(end_t, mbps) in &samples {
+            let start_s = prev_t;
+            prev_t = offset + end_t;
+            if start_s >= duration_s as f64 {
+                break;
+            }
+            link.rate
+                .push((Duration::from_secs_f64(start_s), (mbps * 1e6).max(1e5)));
+        }
+    }
+    let _ = prev_t;
+    link
+}
+
+fn load_leocc_trace(bw_path: &str, delay_path: &str, buffer: u64, duration_s: u64) -> Link {
+    let mut link = load_mahimahi_pkt_trace(bw_path, ms(40), buffer, duration_s);
+    link.random_loss = 0.0001;
+    let delay_str = std::fs::read_to_string(delay_path)
+        .unwrap_or_else(|e| panic!("failed to read LeoCC delay {delay_path}: {e}"));
+    let delays: Vec<u64> = delay_str
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .collect();
+    if !delays.is_empty() {
+        // Each delay sample is 10 ms one-way addition above 20 ms base RTT
+        let mut sched = Vec::new();
+        let total_steps = (duration_s * 100) as usize;
+        for step in (0..total_steps).step_by(5) {
+            let d = delays[step % delays.len()];
+            let rtt = ms(20 + 2 * d);
+            if sched.last().map_or(true, |&(_, last)| last != rtt) {
+                sched.push((ms(step as u64 * 10), rtt));
+            }
+        }
+        link.rtt_schedule = sched;
+    }
+    link
+}
+
+fn load_mortise_app_wk(path: &str) -> Vec<(Duration, u64)> {
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read workload {path}: {e}"));
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+            let mut it = trimmed.split_whitespace();
+            let gap = it.next()?.parse::<u64>().ok()?;
+            let size = it.next()?.parse::<u64>().ok()?;
+            Some((ms(gap), size))
+        })
+        .collect()
+}
+
+fn interp_cdf(cdf: &[(f64, u64)], u: f64) -> u64 {
+    if u <= cdf[0].0 {
+        return cdf[0].1;
+    }
+    for w in cdf.windows(2) {
+        let (p0, v0) = w[0];
+        let (p1, v1) = w[1];
+        if u <= p1 {
+            let frac = (u - p0) / (p1 - p0).max(1e-9);
+            return (v0 as f64 + frac * (v1 as f64 - v0 as f64)).round() as u64;
+        }
+    }
+    cdf.last().unwrap().1
+}
+
+/// DCTCP Web Search workload (Alizadeh et al., SIGCOMM '10) scaled for wireless link evaluation
+fn dctcp_web_search_workload() -> Vec<(Duration, u64)> {
+    const CDF: &[(f64, u64)] = &[
+        (0.00, 6 * 1024),
+        (0.15, 13 * 1024),
+        (0.20, 19 * 1024),
+        (0.30, 33 * 1024),
+        (0.53, 53 * 1024),
+        (0.60, 133 * 1024),
+        (0.70, 380 * 1024),
+        (0.80, 750 * 1024),
+        (0.90, 1400 * 1024),
+        (0.97, 2200 * 1024),
+        (1.00, 3200 * 1024),
+    ];
+    let mut x = 0xDCDC_2010_u64;
+    let mut next_u = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    };
+    (0..80)
+        .map(|i| {
+            let u_size = next_u();
+            let u_gap = next_u();
+            let gap_ms = if i == 0 || u_gap < 0.25 {
+                0
+            } else {
+                (300.0 + 2400.0 * u_gap) as u64
+            };
+            (ms(gap_ms), interp_cdf(CDF, u_size))
+        })
+        .collect()
+}
+
+/// VL2 Data Mining workload (Greenberg et al., SIGCOMM '09): 80% short RPC/query + 20% large
+fn vl2_datamining_workload() -> Vec<(Duration, u64)> {
+    const CDF: &[(f64, u64)] = &[
+        (0.00, 2 * 1024),
+        (0.50, 12 * 1024),
+        (0.80, 80 * 1024),
+        (0.85, 250 * 1024),
+        (0.90, 600 * 1024),
+        (0.95, 1500 * 1024),
+        (1.00, 3000 * 1024),
+    ];
+    let mut x = 0x564C_3209_u64;
+    let mut next_u = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    };
+    (0..80)
+        .map(|i| {
+            let u_size = next_u();
+            let u_gap = next_u();
+            let gap_ms = if i == 0 || u_gap < 0.30 {
+                0
+            } else {
+                (200.0 + 2000.0 * u_gap) as u64
+            };
+            (ms(gap_ms), interp_cdf(CDF, u_size))
+        })
+        .collect()
+}
+
+/// Interactive HTTP/3 Web PageLoad burst workload (20 page views x 4 burst objects)
+fn web_pageload_workload() -> Vec<(Duration, u64)> {
+    let objs = [18 * 1024, 54 * 1024, 180 * 1024, 720 * 1024];
+    let mut out = Vec::with_capacity(80);
+    for p in 0..20 {
+        for (k, &sz) in objs.iter().enumerate() {
+            let gap = if p == 0 && k == 0 {
+                ms(0)
+            } else if k == 0 {
+                ms(2500)
+            } else {
+                ms(20)
+            };
+            out.push((gap, sz));
+        }
+    }
+    out
+}
+
+#[derive(Default)]
+struct RctSummary {
+    planned: usize,
+    completed: usize,
+    within_1s: usize,
+    within_5s: usize,
+    mean_ms: f64,
+    p50_ms: f64,
+    p90_ms: f64,
+    p95_ms: f64,
+    small_p95_ms: f64,
+    med_p95_ms: f64,
+    large_p95_ms: f64,
+}
+
+fn summarize_rct(reqs: &[RequestTiming], cutoff: Duration) -> RctSummary {
+    let planned = reqs.len();
+    let mut rcts_ms = Vec::with_capacity(planned);
+    let mut small = Vec::new();
+    let mut med = Vec::new();
+    let mut large = Vec::new();
+    let mut within_1s = 0;
+    let mut within_5s = 0;
+    for r in reqs {
+        let rct_ms = match r.completed.filter(|&c| c <= cutoff) {
+            Some(c) => {
+                let rct = c.saturating_sub(r.scheduled);
+                if rct <= secs(1) {
+                    within_1s += 1;
+                }
+                if rct <= secs(5) {
+                    within_5s += 1;
+                }
+                rct.as_secs_f64() * 1e3
+            }
+            None => cutoff.saturating_sub(r.scheduled).as_secs_f64() * 1e3,
+        };
+        rcts_ms.push(rct_ms);
+        if r.size < 100 * 1024 {
+            small.push(rct_ms);
+        } else if r.size < 1024 * 1024 {
+            med.push(rct_ms);
+        } else {
+            large.push(rct_ms);
+        }
+    }
+    let completed = reqs
+        .iter()
+        .filter(|r| r.completed.is_some_and(|c| c <= cutoff))
+        .count();
+    let pct = |v: &mut Vec<f64>, q: f64| -> f64 {
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = ((v.len() as f64 * q).ceil() as usize)
+            .saturating_sub(1)
+            .min(v.len() - 1);
+        v[idx]
+    };
+    let mean_ms = rcts_ms.iter().sum::<f64>() / planned.max(1) as f64;
+    let p50_ms = pct(&mut rcts_ms, 0.50);
+    let p90_ms = pct(&mut rcts_ms, 0.90);
+    let p95_ms = pct(&mut rcts_ms, 0.95);
+    let small_p95_ms = pct(&mut small, 0.95);
+    let med_p95_ms = pct(&mut med, 0.95);
+    let large_p95_ms = pct(&mut large, 0.95);
+    RctSummary {
+        planned,
+        completed,
+        within_1s,
+        within_5s,
+        mean_ms,
+        p50_ms,
+        p90_ms,
+        p95_ms,
+        small_p95_ms,
+        med_p95_ms,
+        large_p95_ms,
+    }
+}
+
+#[test]
+#[ignore]
+fn academic_rct_benchmark() {
+    let mahimahi_dir = "/Users/qwe/Desktop/my/project/copa-delta-repro/traces/mahimahi";
+    let leo_dir = "/Users/qwe/Desktop/my/project/copa-delta-repro/traces/leocc/extracted";
+    let scratch_traces =
+        "/Users/qwe/.gemini/antigravity/brain/c5a8237b-bc0c-474b-8330-542f174e48e2/scratch/traces";
+    let app_wk_path = "/Users/qwe/.gemini/antigravity/brain/c5a8237b-bc0c-474b-8330-542f174e48e2/scratch/workloads/app.wk";
+
+    let cutoff = secs(260);
+    let traces: Vec<(&str, Link)> = vec![
+        (
+            "ATT-LTE-2016",
+            load_mahimahi_pkt_trace(
+                &format!("{mahimahi_dir}/ATT-LTE-driving-2016.down"),
+                ms(20),
+                2_000_000,
+                260,
+            ),
+        ),
+        (
+            "ATT-LTE-driving",
+            load_mahimahi_pkt_trace(
+                &format!("{mahimahi_dir}/ATT-LTE-driving.down"),
+                ms(20),
+                2_000_000,
+                260,
+            ),
+        ),
+        (
+            "TMobile-LTE",
+            load_mahimahi_pkt_trace(
+                &format!("{mahimahi_dir}/TMobile-LTE-driving.down"),
+                ms(20),
+                2_000_000,
+                260,
+            ),
+        ),
+        (
+            "Verizon-LTE",
+            load_mahimahi_pkt_trace(
+                &format!("{mahimahi_dir}/Verizon-LTE-driving.down"),
+                ms(20),
+                2_000_000,
+                260,
+            ),
+        ),
+        (
+            "NYC-4G-Walk",
+            load_mahimahi_pkt_trace(
+                &format!("{scratch_traces}/nyc-walk-timessquare.trace"),
+                ms(20),
+                2_000_000,
+                260,
+            ),
+        ),
+        (
+            "NYC-4G-Bus",
+            load_mahimahi_pkt_trace(
+                &format!("{scratch_traces}/nyc-drive-bus.trace"),
+                ms(20),
+                2_000_000,
+                260,
+            ),
+        ),
+        (
+            "NYC-4G-Subway",
+            load_mahimahi_pkt_trace(
+                &format!("{scratch_traces}/nyc-subway.down"),
+                ms(20),
+                2_000_000,
+                260,
+            ),
+        ),
+        (
+            "Lumos5G-Walk",
+            load_lumos5g_trace(
+                &format!("{scratch_traces}/5g_trace_100_walking.mbps"),
+                ms(20),
+                16_000_000,
+                260,
+            ),
+        ),
+        (
+            "Starlink-Leo85",
+            load_leocc_trace(
+                &format!("{leo_dir}/Anonymous_A_downlink/85/bw_85.txt"),
+                &format!("{leo_dir}/Anonymous_A_downlink/85/delay_85.txt"),
+                16_000_000,
+                260,
+            ),
+        ),
+    ];
+
+    let workloads: Vec<(&str, Vec<(Duration, u64)>)> = vec![
+        ("Mortise-app.wk", load_mortise_app_wk(app_wk_path)),
+        ("DCTCP-WebSearch", dctcp_web_search_workload()),
+        ("VL2-DataMining", vl2_datamining_workload()),
+        ("HTTP3-PageLoad", web_pageload_workload()),
+    ];
+
+    let ccs = [
+        "copa-auto",
+        "copa-auto-t98",
+        "copa-auto-nc",
+        "copa-0.5",
+        "bbr",
+        "cubic",
+    ];
+
+    println!(
+        "{:<16} {:<15} {:<14} {:>7} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "Trace",
+        "Workload",
+        "CC",
+        "Done",
+        "<=1s%",
+        "<=5s%",
+        "Mean(ms)",
+        "P50(ms)",
+        "P90(ms)",
+        "P95(ms)",
+        "<100K_95",
+        "100K-1M",
+        ">=1M_95"
+    );
+
+    for (wk_name, wk) in &workloads {
+        for (tr_name, link) in &traces {
+            for &cc_name in &ccs {
+                let dummy = Source::copa(CopaConfig::default());
+                let mut sim = Sim::new(link.clone(), vec![workload_flow(dummy, wk.clone())]);
+                let epoch = sim.epoch();
+                match cc_name {
+                    "copa-auto" => sim.set_copa(0, copa_auto(epoch, true)),
+                    "copa-auto-t98" => {
+                        let mut auto = CopaAutoConfig::default();
+                        auto.probe_epoch(Some(epoch)).tradeoff(0.98);
+                        let mut cfg = CopaConfig::copa_auto();
+                        cfg.adaptive(Some(auto)).mode_switching(true);
+                        sim.set_copa(0, cfg);
+                    }
+                    "copa-auto-nc" => sim.set_copa(0, copa_auto(epoch, false)),
+                    "copa-0.5" => sim.set_copa(0, CopaConfig::default()),
+                    "bbr" => {
+                        sim.flows[0].source = Source::other(BbrConfig::default());
+                    }
+                    "cubic" => {
+                        sim.flows[0].source = Source::other(CubicConfig::default());
+                    }
+                    _ => unreachable!(),
+                }
+                let rep = sim.run(cutoff, Duration::ZERO);
+                let s = summarize_rct(&rep.requests[0], cutoff);
+                println!(
+                    "{:<16} {:<15} {:<14} {:>3}/{:<3} {:>5.1}% {:>5.1}% {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
+                    tr_name,
+                    wk_name,
+                    cc_name,
+                    s.completed,
+                    s.planned,
+                    100.0 * s.within_1s as f64 / s.planned as f64,
+                    100.0 * s.within_5s as f64 / s.planned as f64,
+                    s.mean_ms,
+                    s.p50_ms,
+                    s.p90_ms,
+                    s.p95_ms,
+                    s.small_p95_ms,
+                    s.med_p95_ms,
+                    s.large_p95_ms,
                 );
             }
         }

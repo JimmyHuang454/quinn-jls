@@ -118,6 +118,24 @@ impl Source {
 pub(super) struct Flow {
     pub(super) source: Source,
     pub(super) start: Duration,
+    /// Optional scheduled requests `(gap, size_bytes)` for RCT / FCT evaluation.
+    /// Empty means an infinite-backlog bulk flow.
+    pub(super) workload: Vec<(Duration, u64)>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RequestTiming {
+    pub(super) id: usize,
+    pub(super) size: u64,
+    pub(super) scheduled: Duration,
+    pub(super) first_byte: Option<Duration>,
+    pub(super) completed: Option<Duration>,
+}
+
+impl RequestTiming {
+    pub(super) fn rct(&self) -> Option<Duration> {
+        self.completed.map(|c| c.saturating_sub(self.scheduled))
+    }
 }
 
 /// Measurements over `[warmup, duration)`
@@ -144,6 +162,8 @@ pub(super) struct Report {
     pub(super) persistent: Vec<u64>,
     /// Goodput of each flow in each second of the window, bits per second
     pub(super) per_second: Vec<Vec<f64>>,
+    /// Per-request timing records for workload flows
+    pub(super) requests: Vec<Vec<RequestTiming>>,
 }
 
 impl Report {
@@ -164,6 +184,10 @@ impl Report {
 #[derive(Debug)]
 enum Event {
     Wake(usize),
+    RequestArrive {
+        flow: usize,
+        req_id: usize,
+    },
     Deliver {
         flow: usize,
         pn: u64,
@@ -190,11 +214,17 @@ struct Sender {
     rtt: Option<RttEstimator>,
     next_pn: u64,
     in_flight: u64,
-    sent: BTreeMap<u64, (Instant, u64)>,
+    sent: BTreeMap<u64, (Instant, u64, Vec<(usize, u64)>)>,
     next_send: Option<Instant>,
     wake_at: Option<Instant>,
     /// First loss since the last ACK, for persistent congestion
     loss_run_start: Option<Instant>,
+    // Scheduled workload state
+    requests: Vec<RequestTiming>,
+    req_delivered: Vec<u64>,
+    app_queue: VecDeque<(usize, u64)>,
+    retransmit_queue: VecDeque<(usize, u64)>,
+    app_limited: bool,
     // Receiver
     pending: Vec<u64>,
     pending_since: Option<Instant>,
@@ -316,7 +346,26 @@ impl Sim {
         self.end = end;
         for i in 0..self.flows.len() {
             let start = self.t0 + self.flows[i].start;
-            self.schedule(start, Event::Wake(i));
+            if self.flows[i].workload.is_empty() {
+                self.schedule(start, Event::Wake(i));
+            } else {
+                self.senders[i].app_limited = true;
+                let mut sched = Duration::ZERO;
+                let items = self.flows[i].workload.clone();
+                for (id, (gap, size)) in items.into_iter().enumerate() {
+                    sched += gap;
+                    self.senders[i].requests.push(RequestTiming {
+                        id,
+                        size,
+                        scheduled: sched,
+                        first_byte: None,
+                        completed: None,
+                    });
+                    self.senders[i].req_delivered.push(0);
+                    let req_at = start + sched + self.base_rtt_at(start + sched) / 2;
+                    self.schedule(req_at, Event::RequestArrive { flow: i, req_id: id });
+                }
+            }
         }
         // Offered capacity, integrated over the measurement window
         let step = Duration::from_millis(1);
@@ -337,6 +386,13 @@ impl Sim {
                     if self.senders[i].wake_at == Some(at) || self.senders[i].wake_at.is_none() {
                         self.senders[i].wake_at = None;
                         self.try_send(i);
+                    }
+                }
+                Event::RequestArrive { flow, req_id } => {
+                    let size = self.senders[flow].requests[req_id].size;
+                    if size > 0 {
+                        self.senders[flow].app_queue.push_back((req_id, size));
+                        self.try_send(flow);
                     }
                 }
                 Event::Deliver { flow, pn } => self.on_deliver(flow, pn),
@@ -391,6 +447,7 @@ impl Sim {
                         .collect()
                 })
                 .collect(),
+            requests: s.iter().map(|s| s.requests.clone()).collect(),
         }
     }
 
@@ -414,6 +471,7 @@ impl Sim {
         }
 
         let base_rtt = self.link.base_rtt;
+        let is_workload = !self.flows[i].workload.is_empty();
         loop {
             let pacing = self.link.pacing;
             let sender = &mut self.senders[i];
@@ -421,16 +479,55 @@ impl Sim {
                 .rtt
                 .get_or_insert_with(|| RttEstimator::new(base_rtt * 2));
             let cc = self.flows[i].source.cc().unwrap();
+            if is_workload && sender.retransmit_queue.is_empty() && sender.app_queue.is_empty() {
+                sender.app_limited = true;
+                cc.on_app_limited(sender.in_flight);
+                return;
+            }
             let window = cc.window();
             if sender.in_flight + MTU > window {
+                if is_workload {
+                    sender.app_limited = false;
+                }
+                cc.on_cwnd_limited();
                 return;
             }
             if let Some(next) = sender.next_send.filter(|&next| next > now) {
+                if is_workload {
+                    sender.app_limited = false;
+                }
                 if sender.wake_at.is_none_or(|w| w > next) {
                     sender.wake_at = Some(next);
                     self.schedule(next, Event::Wake(i));
                 }
                 return;
+            }
+            let mut slices = Vec::new();
+            if is_workload {
+                let mut rem = MTU;
+                while rem > 0 {
+                    if let Some((req_id, avail)) = sender.retransmit_queue.front_mut() {
+                        let take = (*avail).min(rem);
+                        slices.push((*req_id, take));
+                        *avail -= take;
+                        rem -= take;
+                        if *avail == 0 {
+                            sender.retransmit_queue.pop_front();
+                        }
+                    } else if let Some((req_id, avail)) = sender.app_queue.front_mut() {
+                        let take = (*avail).min(rem);
+                        slices.push((*req_id, take));
+                        *avail -= take;
+                        rem -= take;
+                        if *avail == 0 {
+                            sender.app_queue.pop_front();
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                sender.app_limited =
+                    sender.retransmit_queue.is_empty() && sender.app_queue.is_empty();
             }
             let default_rate = 1.25 * window as f64 / rtt.get().as_secs_f64();
             let rate = match pacing {
@@ -440,10 +537,13 @@ impl Sim {
             let pn = sender.next_pn;
             sender.next_pn += 1;
             sender.in_flight += MTU;
-            sender.sent.insert(pn, (now, MTU));
+            sender.sent.insert(pn, (now, MTU, slices));
             let gap = Duration::from_secs_f64(MTU as f64 / rate.max(1.0));
             sender.next_send = Some(sender.next_send.map_or(now, |n| n.max(now)) + gap);
             cc.on_sent(now, MTU, pn);
+            if is_workload && sender.app_limited {
+                cc.on_app_limited(sender.in_flight);
+            }
             self.transmit_packet(i, pn, MTU);
         }
     }
@@ -521,7 +621,22 @@ impl Sim {
 
     fn on_deliver(&mut self, i: usize, pn: u64) {
         let now = self.now;
+        let flow_start = self.t0 + self.flows[i].start;
+        let rel = now.saturating_duration_since(flow_start);
         let s = &mut self.senders[i];
+        if let Some((_, _, slices)) = s.sent.get(&pn) {
+            for &(req_id, bytes) in slices {
+                if s.requests[req_id].first_byte.is_none() {
+                    s.requests[req_id].first_byte = Some(rel);
+                }
+                s.req_delivered[req_id] += bytes;
+                if s.req_delivered[req_id] >= s.requests[req_id].size
+                    && s.requests[req_id].completed.is_none()
+                {
+                    s.requests[req_id].completed = Some(rel);
+                }
+            }
+        }
         s.pending.push(pn);
         if !self.link.delayed_ack || s.pending.len() >= 2 {
             self.flush_acks(i);
@@ -568,14 +683,15 @@ impl Sim {
         let measuring = self.measuring(now);
         let s = &mut self.senders[i];
         let rtt = s.rtt.expect("sent before acked");
+        let app_limited = s.app_limited;
         let cc = self.flows[i].source.cc().unwrap();
         let mut largest = None;
         for pn in pns {
-            let Some((sent, size)) = s.sent.remove(&pn) else {
+            let Some((sent, size, _)) = s.sent.remove(&pn) else {
                 continue;
             };
             s.in_flight -= size;
-            cc.on_ack(now, sent, size, pn, SpaceId::Data, false, &rtt);
+            cc.on_ack(now, sent, size, pn, SpaceId::Data, app_limited, &rtt);
             if measuring {
                 s.delivered += size;
                 let sec = now
@@ -591,7 +707,7 @@ impl Sim {
         let Some((largest, largest_sent)) = largest else {
             return;
         };
-        cc.on_end_acks(now, s.in_flight, false, Some(largest), SpaceId::Data);
+        cc.on_end_acks(now, s.in_flight, app_limited, Some(largest), SpaceId::Data);
         let mut rtt = rtt;
         rtt.update(ack_delay, now.saturating_duration_since(largest_sent));
         s.rtt = Some(rtt);
@@ -609,10 +725,13 @@ impl Sim {
     fn on_lost(&mut self, i: usize, pn: u64) {
         let now = self.now;
         let s = &mut self.senders[i];
-        let Some((sent, size)) = s.sent.remove(&pn) else {
+        let Some((sent, size, slices)) = s.sent.remove(&pn) else {
             return;
         };
         s.in_flight -= size;
+        for slice in slices.into_iter().rev() {
+            s.retransmit_queue.push_front(slice);
+        }
         // Persistent congestion: losses only, for longer than three smoothed RTTs
         let run_start = *s.loss_run_start.get_or_insert(sent);
         let srtt = s.rtt.map_or(self.link.base_rtt, |r| r.get());
@@ -634,8 +753,17 @@ pub(super) fn flows(sources: Vec<Source>) -> Vec<Flow> {
         .map(|source| Flow {
             source,
             start: Duration::ZERO,
+            workload: Vec::new(),
         })
         .collect()
+}
+
+pub(super) fn workload_flow(source: Source, workload: Vec<(Duration, u64)>) -> Flow {
+    Flow {
+        source,
+        start: Duration::ZERO,
+        workload,
+    }
 }
 
 /// A copa-auto(-NC) configuration whose probes are aligned on `epoch`

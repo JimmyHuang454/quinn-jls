@@ -571,8 +571,19 @@ impl DrainController {
             self.phase = Phase::Normal;
         }
 
-        let probe_dq = (d.kind == DrainKind::MeasureJitter && d.probe_acks > 0)
-            .then(|| d.probe_dq_sum / d.probe_acks as f64);
+        let probe_dq = (d.kind == DrainKind::MeasureJitter && d.probe_acks > 0).then(|| {
+            let mean_dq = d.probe_dq_sum / d.probe_acks as f64;
+            let shift = d.drain_min_rtt.saturating_sub(rtt_min);
+            if d.flat_rounds >= 2
+                && !d.congested
+                && d.drain_min_rtt < Duration::MAX
+                && shift > Duration::from_millis(5).max(rtt_min.mul_f64(0.15))
+            {
+                (mean_dq - shift.as_secs_f64()).max(0.0)
+            } else {
+                mean_dq
+            }
+        });
         let bdp_est = self.estimated_bdp(now, srtt, new_base);
 
         DrainFinished {

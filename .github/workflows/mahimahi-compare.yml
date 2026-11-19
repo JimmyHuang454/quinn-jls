@@ -5,6 +5,7 @@ on:
     branches: ['codex/mahimahi-*']
     paths:
       - .github/workflows/mahimahi-compare.yml
+      - scripts/gen_workloads.py
       - scripts/install_mahimahi.sh
       - scripts/mahimahi_eval.py
       - scripts/mahimahi_rct.py
@@ -13,13 +14,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Quick checks LTE; rct compares download tail latency on LTE at 2 MB; datasets checks new bulk traces."
+        description: "Quick checks LTE; rct checks LTE app.wk; rct-datasets runs all 4 RCT workloads across LTE/NYC/Lumos5G/LeoCC; datasets checks bulk traces."
         required: true
         default: "quick"
         type: choice
         options:
           - quick
           - rct
+          - rct-datasets
           - smoke
           - full
           - nyc-subway
@@ -27,9 +29,19 @@ on:
           - leo
           - datasets
       theta:
-        description: "Theta in [0.01, 0.99] for the competitive and NC Copa-auto variants"
+        description: "Theta in [0.01, 0.99] (or comma-separated list for rct-datasets, e.g. 0.9,0.98)"
         required: true
         default: "0.98"
+        type: string
+      repeats:
+        description: "Number of time-shifted repeats per configuration (default 1)"
+        required: true
+        default: "1"
+        type: string
+      rct_workloads:
+        description: "Comma-separated workloads for rct-datasets (app,websearch,vl2,pageload)"
+        required: false
+        default: "app,websearch,vl2,pageload"
         type: string
       run_mortise:
         description: "Also build and run official BobAnkh/Mortise in parallel"
@@ -61,6 +73,7 @@ jobs:
       - id: matrix
         env:
           MODE: ${{ inputs.mode || (github.ref_name == 'codex/mahimahi-rct' && 'rct') || 'datasets' }}
+          RCT_WORKLOADS: ${{ inputs.rct_workloads || 'app,websearch,vl2,pageload' }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
@@ -69,14 +82,18 @@ jobs:
           shards = {
               'quick': ['smoke'],
               'rct': ['smoke'],
+              'rct-datasets': ['lte', 'nyc-rct', 'lumos-rct', 'leo'],
               'full': ['lte', 'nyc-stat', 'nyc-walk-1', 'nyc-walk-2', 'nyc-walk-3',
                        'nyc-drive-1', 'nyc-drive-2', 'synth', 'nyc-subway', 'lumos-5g'],
               'datasets': ['nyc-subway', 'lumos-5g', 'leo'],
           }.get(mode, [mode])
+          rct_workloads = [w.strip() for w in os.environ['RCT_WORKLOADS'].split(',') if w.strip()] or ['app']
           include = []
           for shard in shards:
               if mode == 'rct':
                   workloads = ['app']
+              elif mode == 'rct-datasets':
+                  workloads = rct_workloads
               else:
                   workloads = ['bulk'] if mode == 'datasets' or shard == 'leo' else ['bulk', 'app']
               for workload in workloads:
@@ -120,12 +137,14 @@ jobs:
           mkdir -p /tmp/workloads
           curl -fsSL --retry 3 -o /tmp/workloads/app.wk \
             "https://raw.githubusercontent.com/BobAnkh/Mortise/main/mortise/workload/app.wk"
+          python3 scripts/gen_workloads.py --out-dir /tmp/workloads
           python3 -c 'print("\n".join(["0\t2097152"] * 200))' > /tmp/workloads/bulk.wk
 
       - name: Run quinn-perf Mahimahi suite (${{ matrix.shard }})
         env:
           MODE: ${{ needs.plan.outputs.mode }}
           THETA: ${{ inputs.theta || '0.98' }}
+          REPEATS: ${{ inputs.repeats || '1' }}
           SHARD: ${{ matrix.shard }}
           WORKLOAD: ${{ matrix.workload }}
           SEND_FAIRNESS: ${{ inputs.send_fairness && 'true' || 'false' }}
@@ -133,12 +152,19 @@ jobs:
         run: |
           BULK_SECS=45
           APP_SECS=200
-          CCS="copa-auto,copa-auto-nc,copa-auto-theta${THETA},copa-auto-nc-theta${THETA},copa,bbr1,cubic"
+          FIRST_THETA="${THETA%%,*}"
+          THETA_CCS=""
+          IFS=',' read -ra THETA_LIST <<< "$THETA"
+          for tv in "${THETA_LIST[@]}"; do
+            tv="${tv// /}"
+            [ -n "$tv" ] && THETA_CCS="${THETA_CCS:+${THETA_CCS},}copa-auto-theta${tv}"
+          done
+          CCS="copa-auto,copa-auto-nc,copa-auto-theta${FIRST_THETA},copa-auto-nc-theta${FIRST_THETA},copa,bbr1,cubic"
           QUEUES="150000,2000000"
           PARALLEL=4
           if [ "$SHARD" = "smoke" ]; then BULK_SECS=30; fi
           if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then
-            CCS="copa,copa-auto,copa-auto-theta${THETA}"
+            CCS="copa,copa-auto,copa-auto-theta${FIRST_THETA}"
             QUEUES="150000"
           fi
           if [ "$MODE" = "rct" ]; then
@@ -147,19 +173,25 @@ jobs:
             APP_SECS=260
             export RUST_LOG="warn,quinn_proto::congestion::copa=debug"
           fi
+          if [ "$MODE" = "rct-datasets" ]; then
+            CCS="copa-auto,${THETA_CCS},copa-auto-nc,copa,bbr1,cubic"
+            QUEUES="2000000"
+            APP_SECS=0
+          fi
           EXTRA_ARGS=()
-          if [ "$SHARD" = "lumos-5g" ]; then
+          if [ "$SHARD" = "lumos-5g" ] || [ "$SHARD" = "lumos-rct" ]; then
             QUEUES="2000000,16000000"
             PARALLEL=2
             EXTRA_ARGS+=(--connection-window 64M)
             if [ "$MODE" = "datasets" ]; then QUEUES="2000000"; fi
+            if [ "$MODE" = "rct-datasets" ]; then QUEUES="16000000"; fi
           fi
           if [ "$SHARD" = "leo" ]; then
             BULK_SECS=115
             QUEUES="2000000,75000000"
             PARALLEL=2
             EXTRA_ARGS+=(--connection-window 64M)
-            if [ "$MODE" = "datasets" ]; then QUEUES="2000000"; fi
+            if [ "$MODE" = "datasets" ] || [ "$MODE" = "rct-datasets" ]; then QUEUES="2000000"; fi
           fi
           if [ -n "$STREAM_RECEIVE_WINDOW" ]; then
             EXTRA_ARGS+=(--stream-receive-window "$STREAM_RECEIVE_WINDOW")
@@ -172,12 +204,14 @@ jobs:
             --workloads "$WORKLOAD" \
             --bulk-secs "$BULK_SECS" \
             --app-secs "$APP_SECS" \
+            --repeats "$REPEATS" \
             --send-fairness "$SEND_FAIRNESS" \
             "${EXTRA_ARGS[@]}" \
             --parallel "$PARALLEL" \
             --bin ./target/release/quinn-perf \
             --trace-dir /tmp/traces \
             --app-workload /tmp/workloads/app.wk \
+            --app-workloads "app=/tmp/workloads/app.wk,websearch=/tmp/workloads/websearch.wk,vl2=/tmp/workloads/vl2.wk,pageload=/tmp/workloads/pageload.wk" \
             --bulk-workload /tmp/workloads/bulk.wk \
             --out-dir /tmp/quinn_out
 
@@ -279,6 +313,7 @@ jobs:
       - name: Run Mortise Mahimahi suite (${{ matrix.shard }})
         env:
           MODE: ${{ needs.plan.outputs.mode }}
+          REPEATS: ${{ inputs.repeats || '1' }}
           SHARD: ${{ matrix.shard }}
           WORKLOAD: ${{ matrix.workload }}
         run: |
@@ -286,6 +321,7 @@ jobs:
           OUT="/tmp/mortise_out"
           mkdir -p "$OUT" /tmp/workloads
           cp /tmp/Mortise/mortise/workload/app.wk /tmp/workloads/app.wk
+          python3 scripts/gen_workloads.py --out-dir /tmp/workloads
           python3 -c 'print("0\t2097152\n" * 8192, end="")' > /tmp/workloads/bulk.wk
           BULK_SECS=45
           APP_SECS=200
@@ -297,16 +333,21 @@ jobs:
             QUEUES="2000000"
             APP_SECS=260
           fi
-          if [ "$SHARD" = "lumos-5g" ]; then
+          if [ "$MODE" = "rct-datasets" ]; then
+            QUEUES="2000000"
+            APP_SECS=0
+          fi
+          if [ "$SHARD" = "lumos-5g" ] || [ "$SHARD" = "lumos-rct" ]; then
             QUEUES="2000000,16000000"
             PARALLEL=2
             if [ "$MODE" = "datasets" ]; then QUEUES="2000000"; fi
+            if [ "$MODE" = "rct-datasets" ]; then QUEUES="16000000"; fi
           fi
           if [ "$SHARD" = "leo" ]; then
             BULK_SECS=115
             QUEUES="2000000,75000000"
             PARALLEL=2
-            if [ "$MODE" = "datasets" ]; then QUEUES="2000000"; fi
+            if [ "$MODE" = "datasets" ] || [ "$MODE" = "rct-datasets" ]; then QUEUES="2000000"; fi
           fi
 
           RUNNER_SCRIPT="$PWD/scripts/run_mahimahi_suite.py"
@@ -338,7 +379,7 @@ jobs:
           CCS="mortise_copa,bbr,cubic"
           if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ] || [ "$MODE" = "rct" ]; then
             CCS="mortise_copa"
-          elif [ "${COPA_KMOD:-0}" = "1" ]; then
+          elif [ "$MODE" != "rct-datasets" ] && [ "${COPA_KMOD:-0}" = "1" ]; then
             CCS="${CCS},copa"
           fi
 
@@ -350,10 +391,12 @@ jobs:
             --workloads "$WORKLOAD" \
             --bulk-secs "$BULK_SECS" \
             --app-secs "$APP_SECS" \
+            --repeats "$REPEATS" \
             --parallel "$PARALLEL" \
             --bin ./target/release/client \
             --trace-dir /tmp/traces \
             --app-workload /tmp/workloads/app.wk \
+            --app-workloads "app=/tmp/workloads/app.wk,websearch=/tmp/workloads/websearch.wk,vl2=/tmp/workloads/vl2.wk,pageload=/tmp/workloads/pageload.wk" \
             --bulk-workload /tmp/workloads/bulk.wk \
             --out-dir "$OUT"
 
@@ -395,7 +438,7 @@ jobs:
             --bulk-warmup-s 5.0
           cat /tmp/summary/comparison_summary.md >> "$GITHUB_STEP_SUMMARY"
           EXTRA_ARGS=()
-          if [ "$MODE" = "rct" ]; then EXTRA_ARGS+=(--print-summary); fi
+          if [ "$MODE" = "rct" ] || [ "$MODE" = "rct-datasets" ]; then EXTRA_ARGS+=(--print-summary); fi
           python3 scripts/mahimahi_rct.py --input-dir /tmp/all_results --out-dir /tmp/summary \
             "${EXTRA_ARGS[@]}" >> "$GITHUB_STEP_SUMMARY"
 

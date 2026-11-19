@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import math
 import queue
 import random
 import re
@@ -76,7 +77,13 @@ SHARDS: dict[str, list[str]] = {
     "nyc-drive-2": NYC_DRIVING[3:6],
     "synth": SYNTH_TRACES,
     "nyc-subway": NYC_SUBWAY,
+    "nyc-rct": [
+        "trace-3189663-timessquare",
+        "trace-3109898-bus",
+        "nyc2018-4g-subway-with-cross",
+    ],
     "lumos-5g": LUMOS_5G,
+    "lumos-rct": ["5g_trace_100_walking"],
     "leo": LEO_TRACES,
 }
 
@@ -87,6 +94,71 @@ class Replay:
     down: Path
     delay: Path | None = None
     base_rtt_ms: float = 20.0
+
+
+def shift_pkt_trace(src: Path, out_dir: Path, rep: int, repeats: int) -> Path:
+    """Cyclically shift a Mahimahi packet-delivery-ms trace by (rep - 1) / repeats of its span."""
+    if repeats <= 1 or rep <= 1:
+        return src
+    dst = out_dir / f"{src.name}.r{rep}of{repeats}"
+    if dst.exists() and dst.stat().st_size > 0:
+        return dst
+    stamps = [int(line.strip()) for line in src.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if len(stamps) < 2:
+        return src
+    dur = max(stamps[-1] + 1, 1)
+    offset = (dur * (rep - 1)) // repeats
+    shifted = sorted((ts - offset) % dur for ts in stamps)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    partial = dst.with_suffix(dst.suffix + ".part")
+    partial.write_text("\n".join(map(str, shifted)) + "\n", encoding="utf-8")
+    partial.replace(dst)
+    return dst
+
+
+def shift_delay_trace(src: Path, out_dir: Path, rep: int, repeats: int) -> Path:
+    """Cyclically shift a LeoCC 10 ms per-line delay trace in lockstep with its bandwidth trace."""
+    if repeats <= 1 or rep <= 1:
+        return src
+    dst = out_dir / f"{src.name}.r{rep}of{repeats}"
+    if dst.exists() and dst.stat().st_size > 0:
+        return dst
+    lines = [line.strip() for line in src.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if len(lines) < 2:
+        return src
+    offset = (len(lines) * (rep - 1)) // repeats
+    shifted = lines[offset:] + lines[:offset]
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    partial = dst.with_suffix(dst.suffix + ".part")
+    partial.write_text("\n".join(shifted) + "\n", encoding="utf-8")
+    partial.replace(dst)
+    return dst
+
+
+def shift_replay(replay: Replay, trace_dir: Path, rep: int, repeats: int) -> Replay:
+    if repeats <= 1 or rep <= 1:
+        return replay
+    sdir = trace_dir / "shifted"
+    up = shift_pkt_trace(replay.up, sdir, rep, repeats)
+    down = up if replay.down == replay.up else shift_pkt_trace(replay.down, sdir, rep, repeats)
+    delay = shift_delay_trace(replay.delay, sdir, rep, repeats) if replay.delay is not None else None
+    return Replay(up, down, delay, replay.base_rtt_ms)
+
+
+def workload_span_secs(path: Path) -> float:
+    total_ms = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        total_ms += int(s.split()[0])
+    return total_ms / 1000.0
+
+
+def normalize_workload_label(wk: str) -> str:
+    if wk in ("bulk", "app") or wk.startswith("app-"):
+        return wk
+    return f"app-{wk}"
 
 
 def prepare_replay(trace_name: str, trace_dir: Path, bulk_secs: int) -> Replay:
@@ -309,6 +381,7 @@ def run_quinn_job(
     q_bytes: str,
     workload_kind: str,
     workload_path: Path,
+    stem: str,
     out_dir: Path,
     bulk_secs: int,
     app_secs: int,
@@ -317,7 +390,6 @@ def run_quinn_job(
     connection_window: str | None,
 ) -> tuple[str, int]:
     port = 4433 + slot
-    stem = f"quinn__{workload_kind}__{trace_name}__q{q_bytes}__{cc}"
     log_path = out_dir / f"{stem}.downlink.log"
     sum_path = out_dir / f"{stem}.summary.json"
     srv_log = out_dir / f"{stem}.server.log"
@@ -394,11 +466,11 @@ def run_mortise_job(
     q_bytes: str,
     workload_kind: str,
     workload_path: Path,
+    stem: str,
     out_dir: Path,
     bulk_secs: int,
     app_secs: int,
 ) -> tuple[str, int]:
-    stem = f"mortise__{workload_kind}__{trace_name}__q{q_bytes}__{cc}"
     log_path = out_dir / f"{stem}.downlink.log"
     rct_path = out_dir / f"{stem}.rct.csv"
 
@@ -432,74 +504,123 @@ def main() -> int:
     parser.add_argument("--shard", required=True, choices=list(SHARDS.keys()))
     parser.add_argument("--ccs", required=True, help="Comma-separated congestion algorithms")
     parser.add_argument("--queues", default="150000,2000000", help="Comma-separated queue sizes in bytes")
-    parser.add_argument("--workloads", default="bulk,app", help="Comma-separated workloads (bulk,app)")
+    parser.add_argument("--workloads", default="bulk,app", help="Comma-separated workloads (bulk,app,websearch,vl2,pageload)")
     parser.add_argument("--bulk-secs", type=int, default=45)
-    parser.add_argument("--app-secs", type=int, default=200, help="Application observation window in seconds")
+    parser.add_argument("--app-secs", type=int, default=200, help="Application observation window in seconds (0 = auto: span + 60s)")
+    parser.add_argument("--repeats", type=int, default=1, help="Number of time-shifted repeats per configuration")
     parser.add_argument("--send-fairness", choices=["true", "false"], default="true")
     parser.add_argument("--stream-receive-window", default=None, help="Optional quinn --stream-receive-window (e.g. 8M)")
     parser.add_argument("--connection-window", help="Quinn connection receive and send windows (e.g. 64M)")
     parser.add_argument("--parallel", type=int, default=4)
     parser.add_argument("--bin", required=True, type=Path, help="Path to quinn-perf or Mortise client binary")
     parser.add_argument("--trace-dir", required=True, type=Path)
-    parser.add_argument("--app-workload", required=True, type=Path)
+    parser.add_argument("--app-workload", type=Path, default=None, help="Default app.wk path")
+    parser.add_argument(
+        "--app-workloads",
+        default=None,
+        help="Comma-separated name=path mappings for named request workloads (e.g. app=/tmp/app.wk,websearch=/tmp/websearch.wk)",
+    )
     parser.add_argument("--bulk-workload", required=True, type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
     args = parser.parse_args()
+
+    if args.repeats < 1:
+        raise SystemExit("--repeats must be >= 1")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     traces = SHARDS[args.shard]
     ccs = [c.strip() for c in args.ccs.split(",") if c.strip()]
     queues = [q.strip() for q in args.queues.split(",") if q.strip()]
-    workloads = [w.strip() for w in args.workloads.split(",") if w.strip()]
-    if "app" in workloads:
-        manifest = args.out_dir / "app.wk"
-        if args.app_workload.resolve() != manifest.resolve():
-            shutil.copyfile(args.app_workload, manifest)
+    raw_workloads = [w.strip() for w in args.workloads.split(",") if w.strip()]
 
-    replays = {t: prepare_replay(t, args.trace_dir, args.bulk_secs) for t in traces}
-    for trace, replay in replays.items():
+    app_wk_map: dict[str, Path] = {}
+    if args.app_workload is not None:
+        app_wk_map["app"] = args.app_workload
+    if args.app_workloads:
+        for entry in args.app_workloads.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if "=" not in entry:
+                raise SystemExit(f"Invalid --app-workloads entry {entry!r}; expected name=path")
+            name, path_str = entry.split("=", 1)
+            app_wk_map[normalize_workload_label(name.strip())] = Path(path_str.strip())
+
+    workloads: list[tuple[str, Path, int]] = []
+    for raw_wk in raw_workloads:
+        wk_label = normalize_workload_label(raw_wk)
+        if wk_label == "bulk":
+            workloads.append(("bulk", args.bulk_workload, args.bulk_secs))
+            continue
+        wk_path = app_wk_map.get(wk_label)
+        if wk_path is None:
+            raise SystemExit(f"No workload file configured for {raw_wk!r} (label {wk_label!r})")
+        manifest = args.out_dir / f"{wk_label}.wk"
+        if wk_path.resolve() != manifest.resolve():
+            shutil.copyfile(wk_path, manifest)
+        if args.app_secs > 0:
+            obs_secs = args.app_secs
+        else:
+            obs_secs = max(120, int(math.ceil(workload_span_secs(wk_path))) + 60)
+        workloads.append((wk_label, wk_path, obs_secs))
+
+    base_replays = {t: prepare_replay(t, args.trace_dir, args.bulk_secs) for t in traces}
+    for trace, replay in base_replays.items():
         if replay.delay is not None:
             (args.out_dir / f"{trace}.base-rtt-ms").write_text(f"{replay.base_rtt_ms}\n", encoding="utf-8")
 
-    tasks = []
-    for cc in ccs:
-        for t in traces:
-            for q in queues:
-                for wk in workloads:
-                    wk_path = args.bulk_workload if wk == "bulk" else args.app_workload
-                    tasks.append((cc, t, q, wk, wk_path))
+    replays_by_rep: dict[tuple[str, int], Replay] = {}
+    for rep in range(1, args.repeats + 1):
+        for trace, replay in base_replays.items():
+            replays_by_rep[(trace, rep)] = shift_replay(replay, args.trace_dir, rep, args.repeats)
 
-    print(f"[{args.stack}] shard={args.shard}: {len(tasks)} runs across {len(traces)} traces (parallel={args.parallel})")
+    tasks = []
+    for rep in range(1, args.repeats + 1):
+        for cc in ccs:
+            for t in traces:
+                for q in queues:
+                    for wk_label, wk_path, obs_secs in workloads:
+                        tasks.append((rep, cc, t, q, wk_label, wk_path, obs_secs))
+
+    print(
+        f"[{args.stack}] shard={args.shard}: {len(tasks)} runs across {len(traces)} traces "
+        f"(repeats={args.repeats}, parallel={args.parallel})"
+    )
 
     slot_pool: queue.Queue[int] = queue.Queue()
     for s in range(args.parallel):
         slot_pool.put(s)
 
     def dispatch(item):
-        cc, t, q, wk, wk_path = item
+        rep, cc, t, q, wk_label, wk_path, obs_secs = item
         slot = slot_pool.get()
         try:
-            if wk == "app":
-                stem = f"{args.stack}__app__{t}__q{q}__{cc}"
-                (args.out_dir / f"{stem}.app-seconds").write_text(f"{args.app_secs}\n", encoding="utf-8")
+            rep_suffix = f"__r{rep}" if args.repeats > 1 else ""
+            stem = f"{args.stack}__{wk_label}__{t}__q{q}__{cc}{rep_suffix}"
+            if wk_label != "bulk":
+                (args.out_dir / f"{stem}.app-seconds").write_text(f"{obs_secs}\n", encoding="utf-8")
+            replay = replays_by_rep[(t, rep)]
             if args.stack == "quinn":
                 return run_quinn_job(
                     slot,
                     args.bin,
                     cc,
                     t,
-                    replays[t],
+                    replay,
                     q,
-                    wk,
+                    wk_label,
                     wk_path,
+                    stem,
                     args.out_dir,
                     args.bulk_secs,
-                    args.app_secs,
+                    obs_secs,
                     args.send_fairness,
                     args.stream_receive_window or None,
                     args.connection_window,
                 )
-            return run_mortise_job(args.bin, cc, t, replays[t], q, wk, wk_path, args.out_dir, args.bulk_secs, args.app_secs)
+            return run_mortise_job(
+                args.bin, cc, t, replay, q, wk_label, wk_path, stem, args.out_dir, args.bulk_secs, obs_secs
+            )
         finally:
             slot_pool.put(slot)
 

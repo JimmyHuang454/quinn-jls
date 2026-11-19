@@ -232,13 +232,19 @@ impl Copa {
         let nearly_empty = if let Some(auto) = &self.auto {
             // Subtract verified jitter floor; ignore saturated MAX_JITTER (20 ms) which can reflect
             // an active buffer-filler queue during startup calibration.
-            if let Some(j) = auto.estimate().jitter.filter(|&j| j < 0.015) {
+            let est = auto.estimate();
+            let base_empty = if let Some(j) = est.jitter.filter(|&j| j < 0.015) {
                 let eff_dq = (dq_s - j).max(0.0);
                 let eff_span = (span_s - j).max(0.0);
                 eff_dq <= auto.idle_margin() || eff_dq < 0.1 * eff_span
             } else {
                 dq.is_zero() || dq_s < 0.1 * span_s
-            }
+            };
+            // In default mode, queueing at or below copa-auto's own target dq* (or while
+            // application-limited) is not an external competing buffer-filler.
+            let within_own_target = !self.competitive
+                && (self.last_ack_app_limited || (est.dq_target > 0.0 && dq_s <= 1.15 * est.dq_target));
+            base_empty || within_own_target
         } else {
             // "Nearly empty": queueing delay below 10% of the RTT oscillation of the last four RTTs
             dq.is_zero() || dq_s < 0.1 * span_s
@@ -288,13 +294,18 @@ impl Copa {
             self.same_direction = 0;
         } else {
             self.same_direction += 1;
-            let fast_up = direction == Direction::Up
-                && self
-                    .auto
-                    .as_ref()
-                    .map(|a| a.estimate().dq_target)
-                    .is_some_and(|target| target > 0.0 && self.dq.as_secs_f64() < 0.5 * target);
-            let threshold = if fast_up { 1 } else { 3 };
+            let fast_accel = self
+                .auto
+                .as_ref()
+                .map(|a| a.estimate().dq_target)
+                .is_some_and(|target| {
+                    target > 0.0
+                        && ((direction == Direction::Up && self.dq.as_secs_f64() < 0.5 * target)
+                            || (direction == Direction::Down
+                                && self.last_app_limited_time.is_some()
+                                && self.dq.as_secs_f64() > (2.5 * target).max(0.05)))
+                });
+            let threshold = if fast_accel { 1 } else { 3 };
             if self.same_direction >= threshold {
                 self.velocity = self.velocity.saturating_mul(2);
             }
@@ -502,7 +513,7 @@ impl Copa {
             return true;
         }
 
-        if !self.drain.is_normal() {
+        if !self.drain.is_normal() || self.last_ack_app_limited {
             return false;
         }
 
@@ -649,15 +660,16 @@ impl Controller for Copa {
             self.apply_drain_finished(now, finished, rtt_min);
         }
         let idle_thresh = self.srtt.mul_f64(4.0).max(Duration::from_millis(300));
-        if self.auto.as_ref().is_some_and(|a| a.first_probe_done())
-            && self.drain.is_normal()
+        if self.auto.is_some()
             && !self.slow_start
             && !self.competitive
             && self.last_ack_app_limited
             && now.saturating_duration_since(prev_time) >= idle_thresh
         {
-            // After an application-idle gap, re-enter ACK-clocked slow start (keeping learned
-            // delta/jitter estimates) and anchor cwnd toward recent BDP like BBR RestartFromIdle.
+            // After an application-idle gap, clear any stale drain/recovery cap, re-enter
+            // ACK-clocked slow start (keeping learned delta/jitter estimates), and anchor cwnd
+            // toward recent BDP like BBR RestartFromIdle.
+            self.drain.abort();
             self.slow_start = true;
             self.slow_start_confirm_since = None;
             let floor = (self.config.initial_window as f64).max(0.6 * self.peak_bdp_window);
@@ -811,23 +823,54 @@ impl Controller for Copa {
                     self.delta,
                 );
             }
-            // Additive increase of 1/delta: one packet per RTT
-            self.delta = 1.0 / (1.0 / self.delta + acked_packets / self.window_packets());
+            // Additive increase of 1/delta: one packet per RTT (capped on deep-buffer bloat for
+            // copa-auto once 1/delta > 20 and dq exceeds 3 * max(RTT_min, 30 ms) without loss)
+            let bloat_ceil = rtt_min.mul_f64(3.0).max(Duration::from_millis(90));
+            if self.auto.is_some() && self.delta < 0.05 && dq > bloat_ceil {
+                if dq > bloat_ceil.mul_f64(1.5) {
+                    self.delta = (self.delta * 1.05).min(0.05);
+                }
+            } else {
+                self.delta = 1.0 / (1.0 / self.delta + acked_packets / self.window_packets());
+            }
         }
 
         let increase = if dq.is_zero() {
             true
         } else {
             // Target rate 1 / (delta dq) against the current rate cwnd / RTT_standing, both in
-            // packets per second
+            // packets per second. In copa-auto default mode, cap the standing denominator near
+            // RTT_min + 1.5 * dq* so severe capacity-drop queue spikes (dq >> dq*) do not cancel
+            // out dq in 1 / (delta * dq) and lock cwnd at 1/delta packets.
             let target = 1.0 / (self.delta * dq.as_secs_f64());
-            let current = self.window / mss / standing.as_secs_f64();
+            let eff_standing = if !self.competitive
+                && (recent_app_limited || dq > Duration::from_millis(200))
+                && let Some(auto) = &self.auto
+            {
+                let dq_target = auto.estimate().dq_target;
+                let max_q = (1.5 * dq_target).max(0.5 * rtt_min.as_secs_f64()).max(0.02);
+                standing
+                    .as_secs_f64()
+                    .min(rtt_min.as_secs_f64() + max_q)
+                    .max(1e-6)
+            } else {
+                standing.as_secs_f64()
+            };
+            let current = self.window / mss / eff_standing;
             target >= current
         };
 
-        if app_limited && increase {
-            // The window was not the limit: growing it would not be backed by any measurement
-            return;
+        if app_limited {
+            if increase {
+                // The window was not the limit: growing it would not be backed by any measurement
+                return;
+            }
+            if self.auto.is_some() {
+                let max_tail_q = rtt_min.mul_f64(0.5).max(Duration::from_millis(25));
+                if dq <= max_tail_q {
+                    return;
+                }
+            }
         }
 
         if !(increase && self.slow_start) {

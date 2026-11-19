@@ -4,6 +4,7 @@
 import argparse
 import csv
 import math
+import statistics
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -124,16 +125,105 @@ def summarize(records: list[Timing], cutoff_us: int, source: str) -> dict:
         horizon_us = seconds * 1_000_000
         covered = len(completed) == n or max(r.scheduled_us for r in records) + horizon_us <= cutoff_us
         stats[f"completed_within_{seconds}s"] = sum(t <= horizon_us for t in completed) / n if valid and covered else None
-    for label, fraction in (("p50", 0.50), ("p95", 0.95)):
+    for label, fraction in (("p50", 0.50), ("p90", 0.90), ("p95", 0.95)):
         index = math.ceil(n * fraction) - 1
         value = completed[index] if index < len(completed) else None
         covered = len(completed) == n or (
             value is not None and max(r.scheduled_us for r in records) + value <= cutoff_us
         )
         stats[f"rct_{label}_ms"] = value / 1000 if valid and covered and value is not None else None
+    if valid and completed:
+        censored = [
+            r.rct_us if (r.completed_us is not None and r.completed_us <= cutoff_us) else max(0, cutoff_us - r.scheduled_us)
+            for r in records
+        ]
+        stats["rct_mean_ms"] = (sum(censored) / n) / 1000.0
+    else:
+        stats["rct_mean_ms"] = None
     if not valid:
         stats["completed"] = stats["completion_rate"] = None
     return stats
+
+
+def resolve_schedule_path(folder: Path, workload: str) -> Path:
+    candidate = folder / f"{workload}.wk"
+    if candidate.exists():
+        return candidate
+    return folder / "app.wk"
+
+
+def median_or_none(vals: list[float | None]) -> float | None:
+    clean = [v for v in vals if v is not None]
+    return statistics.median(clean) if clean else None
+
+
+def fmt_ms_agg(vals: list[float | None]) -> str:
+    clean = [v for v in vals if v is not None]
+    if not clean:
+        return "–"
+    med = statistics.median(clean)
+    if len(clean) == 1:
+        return f"{med:.1f}"
+    return f"{med:.1f} ({min(clean):.0f}–{max(clean):.0f})"
+
+
+def fmt_pct_agg(vals: list[float | None]) -> str:
+    med = median_or_none(vals)
+    return "–" if med is None else f"{med:.1%}"
+
+
+def print_grouped_summary(summary: list[dict]) -> None:
+    print("## Download experience from scheduled arrival")
+    print(
+        "\nRates include all planned requests. Mortise timing is aligned to request 1's send timestamp. "
+        "Multiple repeats report median (min–max). A dash indicates missing data or an uncovered tail.\n"
+    )
+    by_run_class: dict[tuple, dict[str, dict]] = {}
+    for row in summary:
+        key = (
+            row["workload"],
+            row["trace"],
+            row["queue_bytes"],
+            row["stack"],
+            row["cc"],
+            row.get("repeat", "1"),
+        )
+        by_run_class.setdefault(key, {})[row["size_class"]] = row
+
+    grouped: dict[tuple, list[dict[str, dict]]] = {}
+    for (wk, trace, q, stack, cc, _rep), classes in sorted(by_run_class.items()):
+        grouped.setdefault((wk, trace, q, stack, cc), []).append(classes)
+
+    workloads = sorted({k[0] for k in grouped})
+    for wk in workloads:
+        print(f"\n### Workload: `{wk}`\n")
+        print(
+            "| Trace | Queue | Stack | CC | Done | ≤1 s | ≤5 s | Mean (ms) | P50 (ms) | P90 (ms) | P95 (ms) | <100 KiB P95 | 100 KiB–1 MiB P95 | ≥1 MiB P95 |"
+        )
+        print("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for (row_wk, trace, q, stack, cc), runs in grouped.items():
+            if row_wk != wk:
+                continue
+            all_rows = [r["all"] for r in runs if "all" in r]
+            if not all_rows:
+                continue
+            planned = all_rows[0]["planned"]
+            comp_vals = [r["completed"] for r in all_rows if r["completed"] is not None]
+            done = "–" if not comp_vals else f"{int(round(statistics.median(comp_vals)))}/{planned}"
+            r1 = fmt_pct_agg([r["completed_within_1s"] for r in all_rows])
+            r5 = fmt_pct_agg([r["completed_within_5s"] for r in all_rows])
+            mean_s = fmt_ms_agg([r["rct_mean_ms"] for r in all_rows])
+            p50_s = fmt_ms_agg([r["rct_p50_ms"] for r in all_rows])
+            p90_s = fmt_ms_agg([r["rct_p90_ms"] for r in all_rows])
+            p95_s = fmt_ms_agg([r["rct_p95_ms"] for r in all_rows])
+            s95 = fmt_ms_agg([r["<100 KiB"]["rct_p95_ms"] for r in runs if "<100 KiB" in r])
+            m95 = fmt_ms_agg([r["100 KiB–1 MiB"]["rct_p95_ms"] for r in runs if "100 KiB–1 MiB" in r])
+            l95 = fmt_ms_agg([r["≥1 MiB"]["rct_p95_ms"] for r in runs if "≥1 MiB" in r])
+            print(
+                "| "
+                + " | ".join([trace, q, stack, cc, done, r1, r5, mean_s, p50_s, p90_s, p95_s, s95, m95, l95])
+                + " |"
+            )
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -156,7 +246,7 @@ def main() -> None:
         stem = marker.stem
         meta = parse_meta_from_stem(stem)
         cutoff_us = int(marker.read_text()) * 1_000_000
-        plan = load_schedule(folder / "app.wk")
+        plan = load_schedule(resolve_schedule_path(folder, meta["workload"]))
         source, timings = load_timings(plan, folder, stem, meta["stack"])
         for r in timings:
             status = "after_cutoff" if r.completed_us is not None and r.completed_us > cutoff_us else r.status
@@ -180,16 +270,7 @@ def main() -> None:
     write_csv(args.out_dir / "app_requests.csv", requests)
     write_csv(args.out_dir / "app_experience.csv", summary)
     if args.print_summary:
-        print("## Download experience from scheduled arrival")
-        print("\nRates include all planned requests. Mortise timing is aligned to request 1's send timestamp. A dash indicates missing data or a percentile/deadline the observation window cannot establish.\n")
-        print("| Stack | CC | Size | Completed | ≤1 s | ≤5 s | ≤15 s | ≤30 s | P50 (s) | P95 (s) |")
-        print("|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
-        for row in summary:
-            completed = "–" if row["completed"] is None else f'{row["completed"]}/{row["planned"]}'
-            values = [row[f"completed_within_{s}s"] for s in DEADLINES_S]
-            rates = ["–" if value is None else f"{value:.1%}" for value in values]
-            times = ["–" if row[k] is None else f"{row[k] / 1000:.3f}" for k in ("rct_p50_ms", "rct_p95_ms")]
-            print("| " + " | ".join([row["stack"], row["cc"], row["size_class"], completed, *rates, *times]) + " |")
+        print_grouped_summary(summary)
 
 
 if __name__ == "__main__":

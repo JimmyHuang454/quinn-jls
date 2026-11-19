@@ -204,17 +204,30 @@ def parse_rct_csv(path: Path, delivered_bytes: int = 0) -> dict[str, Any]:
 
 
 def parse_meta_from_stem(stem: str) -> dict[str, str]:
-    """Extract metadata from `<stack>__<workload>__<trace>__q<bytes>__<cc>`."""
+    """Extract metadata from `<stack>__<workload>__<trace>__q<bytes>__<cc>[__r<k>]`."""
     parts = stem.split("__")
     if len(parts) >= 5:
+        repeat = "1"
+        tail = parts[4:]
+        if len(tail) >= 2 and tail[-1].startswith("r") and tail[-1][1:].isdigit():
+            repeat = tail[-1][1:]
+            tail = tail[:-1]
         return {
             "stack": parts[0],
             "workload": parts[1],
             "trace": parts[2],
             "queue_bytes": parts[3].lstrip("q"),
-            "cc": "__".join(parts[4:]),
+            "cc": "__".join(tail),
+            "repeat": repeat,
         }
-    return {"stack": "unknown", "workload": "unknown", "trace": stem, "queue_bytes": "", "cc": ""}
+    return {
+        "stack": "unknown",
+        "workload": "unknown",
+        "trace": stem,
+        "queue_bytes": "",
+        "cc": "",
+        "repeat": "1",
+    }
 
 
 def fmt_num(val: Any, digits: int = 2) -> str:
@@ -298,6 +311,7 @@ def main() -> None:
         "trace",
         "queue_bytes",
         "cc",
+        "repeat",
         "duration_s",
         "capacity_mbps",
         "throughput_mbps",

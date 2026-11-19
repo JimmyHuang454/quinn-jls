@@ -197,6 +197,7 @@ pub(super) struct AutoDelta {
 #[derive(Debug, Clone, Copy, Default)]
 struct Accumulator {
     dq_sum: f64,
+    stand_dq_sum: f64,
     acks: u64,
     idle: u64,
     max_gap: f64,
@@ -206,6 +207,7 @@ struct Accumulator {
 impl Accumulator {
     fn add(&mut self, other: &Self) {
         self.dq_sum += other.dq_sum;
+        self.stand_dq_sum += other.stand_dq_sum;
         self.acks += other.acks;
         self.idle += other.idle;
         self.max_gap = self.max_gap.max(other.max_gap);
@@ -716,7 +718,16 @@ impl AutoDelta {
             u64::from(cfg.settle_rounds)
         };
         if !settling && self.rounds % half_rounds >= settle_target {
-            let round = self.round;
+            let mut round = self.round;
+            if round.idle == 0
+                && round.acks > 0
+                && let (Some(j), Some(min_rtt)) = (self.est.jitter, round.min_rtt)
+            {
+                let round_min_dq = min_rtt.saturating_sub(s.rtt_min).as_secs_f64();
+                let round_mean_dq = round.dq_sum / round.acks as f64;
+                let stand = (round_min_dq - j).clamp(0.0, (round_mean_dq - j).max(0.0));
+                round.stand_dq_sum = stand * round.acks as f64;
+            }
             self.seg.add(&round);
             self.seg_rounds += 1;
         }
@@ -795,18 +806,58 @@ impl AutoDelta {
         let cfg = &self.config;
         // eq:rho-est: total utilization from the idle fraction
         let rho = (1.0 - self.seg.idle as f64 / self.seg.acks as f64).clamp(0.05, 0.98);
-        // eq:k-est: k = c / mu from dq = j + k rho / (1 - rho)
-        let queueing = (seg_dq - j).max(1e-5);
+        // eq:k-est: k = c / mu from dq = j + k rho / (1 - rho).
+        // Subtract any unconsumed standing-queue floor (segment-wide, or per-round on low-jitter
+        // links where multi-RTT held-jitter plateaus do not occur), keeping at least the minimum
+        // physical queue at delta_max (~1.5 packets = 1.5 * rtt_min / bdp_packets).
+        let pkt_time = if s.bdp_packets > 1.0 {
+            s.rtt_min.as_secs_f64() / s.bdp_packets
+        } else {
+            0.0
+        };
+        let seg_stand = self
+            .seg
+            .min_rtt
+            .map_or(0.0, |m| (m.saturating_sub(s.rtt_min).as_secs_f64() - j).max(0.0));
+        let round_stand = if self.seg.acks > 0 && j <= 2.0 * pkt_time {
+            self.seg.stand_dq_sum / self.seg.acks as f64
+        } else {
+            0.0
+        };
+        let raw_q = (seg_dq - j).max(0.0);
+        let max_stand = (raw_q - 1.5 * pkt_time).max(0.0).min(8.0 * pkt_time);
+        let stand_dq = seg_stand.max(round_stand).clamp(0.0, max_stand);
+        let eff_dq = (seg_dq - j - stand_dq).max(0.0);
+        let floor_dq = if s.bdp_packets > 1.0 && j > 0.0 && rho < 0.95 && seg_dq <= j + 0.15 * j {
+            (0.15 * j * (1.0 - rho)).max(1e-5)
+        } else {
+            1e-5
+        };
+        let queueing = eff_dq.max(floor_dq);
         let k = queueing * (1.0 - rho) / rho;
-        // eq:k-ewma, in the log domain
+        // eq:k-ewma, in the log domain (damping low-SNR censored samples once initialized)
         let ratio = if self.est.ratio <= 0.0 {
             k
         } else {
-            ((1.0 - cfg.weight) * self.est.ratio.ln() + cfg.weight * k.ln()).exp()
+            let w = if s.bdp_packets > 1.0 && j > 1e-3 && seg_dq <= j && k < self.est.ratio {
+                0.25 * cfg.weight
+            } else if s.bdp_packets > 1.0
+                && self.seg.idle == 0
+                && stand_dq < 0.3 * (seg_dq - j).max(1e-5)
+                && k < self.est.ratio
+            {
+                0.5 * cfg.weight
+            } else {
+                cfg.weight
+            };
+            ((1.0 - w) * self.est.ratio.ln() + w * k.ln()).exp()
         };
         // eq:dq-target (theta = 0.5) and eq:dq-target-w
         let base_rtt = s.rtt_min.as_secs_f64() + j;
-        let dq_target = target_dq(j, ratio, base_rtt, cfg.tradeoff);
+        let mut dq_target = target_dq(j, ratio, base_rtt, cfg.tradeoff);
+        if s.bdp_packets > 1.0 && cfg.tradeoff > 0.5 {
+            dq_target = dq_target.min(j + 1.5 * base_rtt);
+        }
 
         // eq:delta-update. At equilibrium delta* = delta dq / dq*. Large steps far from the
         // target, small ones near it where measurement noise dominates.
@@ -1024,11 +1075,9 @@ mod tests {
         let mut a = AutoDelta::new(round_based(), Instant::now());
         a.est.jitter = Some(j);
         a.seg = Accumulator {
-            dq_sum: 0.0,
             acks: 100,
             idle: 2,
-            max_gap: 0.0,
-            min_rtt: None,
+            ..Accumulator::default()
         };
         (a, sample(Instant::now(), ms(40), ms(0)))
     }
@@ -1077,11 +1126,9 @@ mod tests {
         let before = ratio(&a, &b);
         for dq in [0.0012, 0.01, 0.0012, 0.01] {
             a.seg = Accumulator {
-                dq_sum: 0.0,
                 acks: 100,
                 idle: 2,
-                max_gap: 0.0,
-                min_rtt: None,
+                ..Accumulator::default()
             };
             b.seg = a.seg;
             a.update_delta(&s, dq, 0.001, 0.5);
@@ -1471,5 +1518,54 @@ mod tests {
         feed(&mut a, &mut t, ms(12), ms(2), |_| true, |s| s.app_limited = true);
         let second_delta = a.estimate().delta.unwrap();
         assert_ne!(second_delta, first_delta);
+    }
+
+    #[test]
+    fn standing_queue_and_censored_samples_do_not_bias_k() {
+        // 1. Constant low-jitter link (40 ms RTT_min, BDP = 40 pkts => pkt_time = 1 ms):
+        // Busy rounds hold a 7 ms deterministic standing floor while one trough round touches empty.
+        // Subtracting the unconsumed standing floor keeps k small so delta rises above delta_0 = 0.1.
+        let (mut a, mut s) = with_jitter(0.0);
+        s.rtt_min = ms(40);
+        s.bdp_packets = 40.0;
+        a.seg = Accumulator {
+            dq_sum: 0.007 * 100.0,
+            stand_dq_sum: 0.006 * 100.0,
+            acks: 100,
+            idle: 15,
+            max_gap: 0.002,
+            min_rtt: Some(ms(40)),
+        };
+        a.update_delta(&s, 0.007, 0.0, 0.1);
+        assert!(
+            a.estimate().ratio < 4e-4,
+            "standing queue must be subtracted from k: ratio={}",
+            a.estimate().ratio
+        );
+        assert!(
+            a.estimate().delta.unwrap() > 0.1,
+            "delta must increase toward delta_max on constant link: delta={:?}",
+            a.estimate().delta
+        );
+
+        // 2. High-BDP link with jitter floor j = 2 ms: a left-censored half-period (seg_dq <= j
+        // at rho = 0.60) uses the sub-jitter floor rather than collapsing ratio to ~1e-6.
+        let (mut a2, mut s2) = with_jitter(0.002);
+        s2.rtt_min = ms(55);
+        s2.bdp_packets = 1500.0;
+        a2.seg = Accumulator {
+            dq_sum: 0.0015 * 100.0,
+            stand_dq_sum: 0.0,
+            acks: 100,
+            idle: 40,
+            max_gap: 0.001,
+            min_rtt: Some(ms(55)),
+        };
+        a2.update_delta(&s2, 0.0015, 0.002, 0.1);
+        assert!(
+            a2.estimate().ratio >= 5e-5,
+            "left-censored sample must not collapse k to 1e-5*(1-rho)/rho: ratio={}",
+            a2.estimate().ratio
+        );
     }
 }

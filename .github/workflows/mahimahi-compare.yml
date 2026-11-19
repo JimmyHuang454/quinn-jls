@@ -10,6 +10,7 @@ on:
       - scripts/mahimahi_eval.py
       - scripts/mahimahi_rct.py
       - scripts/run_mahimahi_suite.py
+      - kernel/tcp_copa_auto/**
       - perf/src/client.rs
   workflow_dispatch:
     inputs:
@@ -43,8 +44,23 @@ on:
         required: false
         default: "app,websearch,vl2,pageload"
         type: string
+      quinn_ccs:
+        description: "Optional quinn CCs override (empty = mode default; e.g. copa-auto,copa-auto-theta0.98,copa-auto-nc,copa,copa-nc,bbr1,bbr2,bbr3,cubic,new-reno)"
+        required: false
+        default: ""
+        type: string
+      mortise_ccs:
+        description: "Optional Kernel TCP CCs override (empty = mode default; e.g. copa_auto,copa_auto_theta0.98,copa_auto_nc,copa_orig,mortise_copa,bbr,cubic,vegas,cdg,westwood,hybla,reno)"
+        required: false
+        default: ""
+        type: string
+      run_quinn:
+        description: "Also build and run quinn-perf (QUIC) in parallel; leave false for pure Linux Kernel TCP comparison"
+        required: true
+        default: false
+        type: boolean
       run_mortise:
-        description: "Also build and run official BobAnkh/Mortise in parallel"
+        description: "Build and run Linux Kernel TCP stack (tcp_copa_auto.ko + BobAnkh/Mortise + kernel CCs)"
         required: true
         default: true
         type: boolean
@@ -105,6 +121,7 @@ jobs:
   quinn-eval:
     name: quinn (${{ matrix.shard }}, ${{ matrix.workload }})
     needs: plan
+    if: ${{ github.event_name == 'push' || inputs.run_quinn }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
@@ -145,6 +162,7 @@ jobs:
           MODE: ${{ needs.plan.outputs.mode }}
           THETA: ${{ inputs.theta || '0.98' }}
           REPEATS: ${{ inputs.repeats || '1' }}
+          QUINN_CCS: ${{ inputs.quinn_ccs || '' }}
           SHARD: ${{ matrix.shard }}
           WORKLOAD: ${{ matrix.workload }}
           SEND_FAIRNESS: ${{ inputs.send_fairness && 'true' || 'false' }}
@@ -153,13 +171,14 @@ jobs:
           BULK_SECS=45
           APP_SECS=200
           FIRST_THETA="${THETA%%,*}"
+          FIRST_THETA="${FIRST_THETA// /}"
           THETA_CCS=""
           IFS=',' read -ra THETA_LIST <<< "$THETA"
           for tv in "${THETA_LIST[@]}"; do
             tv="${tv// /}"
             [ -n "$tv" ] && THETA_CCS="${THETA_CCS:+${THETA_CCS},}copa-auto-theta${tv}"
           done
-          CCS="copa-auto,copa-auto-nc,copa-auto-theta${FIRST_THETA},copa-auto-nc-theta${FIRST_THETA},copa,bbr1,cubic"
+          CCS="copa-auto,copa-auto-nc,copa-auto-theta${FIRST_THETA},copa-auto-nc-theta${FIRST_THETA},copa,bbr1,bbr3,cubic"
           QUEUES="150000,2000000"
           PARALLEL=4
           if [ "$SHARD" = "smoke" ]; then BULK_SECS=30; fi
@@ -174,9 +193,12 @@ jobs:
             export RUST_LOG="warn,quinn_proto::congestion::copa=debug"
           fi
           if [ "$MODE" = "rct-datasets" ]; then
-            CCS="copa-auto,${THETA_CCS},copa-auto-nc,copa,bbr1,cubic"
+            CCS="copa-auto,${THETA_CCS},copa-auto-nc,copa,bbr1,bbr3,cubic"
             QUEUES="2000000"
             APP_SECS=0
+          fi
+          if [ -n "$QUINN_CCS" ]; then
+            CCS="${QUINN_CCS//\{theta\}/$FIRST_THETA}"
           fi
           EXTRA_ARGS=()
           if [ "$SHARD" = "lumos-5g" ] || [ "$SHARD" = "lumos-rct" ]; then
@@ -241,7 +263,7 @@ jobs:
       - name: Clone BobAnkh/Mortise
         run: git clone --depth 1 https://github.com/BobAnkh/Mortise.git /tmp/Mortise
 
-      - name: Install Mahimahi, eBPF toolchain, and Python deps
+      - name: Install Mahimahi, kernel headers, eBPF toolchain, and Python deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -250,11 +272,9 @@ jobs:
             libpango1.0-dev dnsmasq iproute2 \
             clang llvm libbpf-dev libelf-dev dwarves pkg-config \
             build-essential python3-pip python3-venv curl \
+            "linux-headers-$(uname -r)" \
             linux-tools-common "linux-tools-$(uname -r)" || \
-            sudo apt-get install -y -qq linux-tools-generic || true
-
-          sudo modprobe tcp_bbr || true
-          sudo sysctl -w net.ipv4.tcp_allowed_congestion_control="cubic reno bbr" || true
+            sudo apt-get install -y -qq linux-headers-generic linux-tools-generic || true
 
           if ! command -v bpftool >/dev/null 2>&1; then
             BPFTOOL_BIN=$(find /usr/lib/linux-tools* /usr/sbin /usr/bin -name bpftool -type f 2>/dev/null | head -n1 || true)
@@ -272,6 +292,19 @@ jobs:
           source /home/vagrant/mortise-venv/bin/activate
           pip install -q numpy structlog scipy pandas
           ln -sfn /tmp/Mortise/algorithm /home/vagrant/algorithm
+
+      - name: Build & load tcp_copa_auto kernel module
+        run: |
+          make -C kernel/tcp_copa_auto test
+          make -C kernel/tcp_copa_auto
+          sudo insmod kernel/tcp_copa_auto/tcp_copa_auto.ko
+          for mod in tcp_bbr tcp_vegas tcp_cdg tcp_westwood tcp_hybla; do
+            sudo modprobe "$mod" || true
+          done
+          sudo sysctl -w net.core.default_qdisc=fq || true
+          AVAIL_CCS="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo 'cubic reno bbr')"
+          sudo sysctl -w net.ipv4.tcp_allowed_congestion_control="$AVAIL_CCS" || true
+          echo "Available kernel CCs: $AVAIL_CCS"
 
       - name: Build Mortise BPF object and Rust binaries
         run: |
@@ -313,7 +346,9 @@ jobs:
       - name: Run Mortise Mahimahi suite (${{ matrix.shard }})
         env:
           MODE: ${{ needs.plan.outputs.mode }}
+          THETA: ${{ inputs.theta || '0.98' }}
           REPEATS: ${{ inputs.repeats || '1' }}
+          MORTISE_CCS: ${{ inputs.mortise_ccs || '' }}
           SHARD: ${{ matrix.shard }}
           WORKLOAD: ${{ matrix.workload }}
         run: |
@@ -376,11 +411,33 @@ jobs:
           SRV_PID=$!
           sleep 2
 
-          CCS="mortise_copa,bbr,cubic"
-          if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ] || [ "$MODE" = "rct" ]; then
-            CCS="mortise_copa"
-          elif [ "$MODE" != "rct-datasets" ] && [ "${COPA_KMOD:-0}" = "1" ]; then
+          FIRST_THETA="${THETA%%,*}"
+          FIRST_THETA="${FIRST_THETA// /}"
+          THETA_KERNEL_CCS=""
+          IFS=',' read -ra THETA_LIST <<< "$THETA"
+          for tv in "${THETA_LIST[@]}"; do
+            tv="${tv// /}"
+            [ -n "$tv" ] && THETA_KERNEL_CCS="${THETA_KERNEL_CCS:+${THETA_KERNEL_CCS},}copa_auto_theta${tv}"
+          done
+
+          AVAIL_CCS=" $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo 'cubic reno bbr') "
+          CCS="copa_auto,copa_auto_nc,copa_auto_theta${FIRST_THETA},copa_orig,mortise_copa,bbr,cubic"
+          if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then
+            CCS="copa_auto,copa_auto_theta${FIRST_THETA},copa_orig,mortise_copa"
+          elif [ "$MODE" = "rct" ]; then
+            CCS="copa_auto,copa_auto_theta0.9,copa_auto_theta0.98,copa_orig,mortise_copa"
+          elif [ "$MODE" = "rct-datasets" ]; then
+            CCS="copa_auto,${THETA_KERNEL_CCS},copa_auto_nc,copa_orig,mortise_copa,bbr,cubic"
+            for extra_cc in vegas cdg; do
+              if [[ "$AVAIL_CCS" == *" $extra_cc "* ]]; then
+                CCS="${CCS},${extra_cc}"
+              fi
+            done
+          elif [ "${COPA_KMOD:-0}" = "1" ]; then
             CCS="${CCS},copa"
+          fi
+          if [ -n "$MORTISE_CCS" ]; then
+            CCS="${MORTISE_CCS//\{theta\}/$FIRST_THETA}"
           fi
 
           python3 "$RUNNER_SCRIPT" \

@@ -458,6 +458,38 @@ def run_quinn_job(
             srv.kill()
 
 
+def resolve_mortise_cc(cc: str) -> str:
+    """Map suite CC label (e.g. copa_auto_theta0.98) to Linux kernel TCP CCA name."""
+    norm = cc.replace("-", "_")
+    m = re.match(r"^copa_auto_theta([0-9]*\.?[0-9]+)$", norm)
+    if m:
+        theta_milli = int(round(float(m.group(1)) * 1000))
+        if not (10 <= theta_milli <= 995):
+            raise ValueError(f"theta out of [0.01, 0.995] in {cc!r}")
+        if theta_milli == 500:
+            return "copa_auto"
+        if theta_milli == 900:
+            return "copa_auto_t90"
+        if theta_milli == 980:
+            return "copa_auto_t98"
+        param = Path("/sys/module/tcp_copa_auto/parameters/theta_milli")
+        if param.exists():
+            try:
+                param.write_text(f"{theta_milli}\n", encoding="utf-8")
+            except PermissionError:
+                subprocess.run(
+                    ["sudo", "tee", str(param)],
+                    input=f"{theta_milli}\n",
+                    text=True,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                )
+        return "copa_auto_t"
+    if norm in ("copa_auto", "copa_auto_nc", "copa_auto_t90", "copa_auto_t98", "copa_auto_t", "copa_orig"):
+        return norm
+    return cc
+
+
 def run_mortise_job(
     bin_path: Path,
     cc: str,
@@ -473,18 +505,19 @@ def run_mortise_job(
 ) -> tuple[str, int]:
     log_path = out_dir / f"{stem}.downlink.log"
     rct_path = out_dir / f"{stem}.rct.csv"
+    kernel_cc = resolve_mortise_cc(cc)
 
     if workload_kind == "bulk":
         # Bulk only needs the link log. Terminate at the deadline without waiting for an RCT report.
         client_cmd = (
             f'timeout -k 5 {bulk_secs} "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
-            f'--congestion "{cc}" --workload "{workload_path}" --output "{rct_path}"; '
+            f'--congestion "{kernel_cc}" --workload "{workload_path}" --output "{rct_path}"; '
             'status=$?; if [ "$status" -eq 124 ]; then exit 0; fi; exit "$status"'
         )
     else:
         client_cmd = (
             f'timeout {app_secs + 20} "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
-            f'--congestion "{cc}" --workload "{workload_path}" --output "{rct_path}"'
+            f'--congestion "{kernel_cc}" --workload "{workload_path}" --output "{rct_path}"'
         )
     # For bulk runs, timeout exit code 124 is expected when stopping cleanly at bulk_secs.
     expected = log_path if workload_kind == "bulk" else rct_path

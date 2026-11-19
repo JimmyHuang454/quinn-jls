@@ -32,7 +32,7 @@ on:
       theta:
         description: "Theta in [0.01, 0.99] (or comma-separated list for rct-datasets, e.g. 0.9,0.98)"
         required: true
-        default: "0.98"
+        default: "0.9"
         type: string
       repeats:
         description: "Number of time-shifted repeats per configuration (default 1)"
@@ -160,7 +160,7 @@ jobs:
       - name: Run quinn-perf Mahimahi suite (${{ matrix.shard }})
         env:
           MODE: ${{ needs.plan.outputs.mode }}
-          THETA: ${{ inputs.theta || '0.98' }}
+          THETA: ${{ inputs.theta || '0.9' }}
           REPEATS: ${{ inputs.repeats || '1' }}
           QUINN_CCS: ${{ inputs.quinn_ccs || '' }}
           SHARD: ${{ matrix.shard }}
@@ -183,7 +183,7 @@ jobs:
           PARALLEL=4
           if [ "$SHARD" = "smoke" ]; then BULK_SECS=30; fi
           if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then
-            CCS="copa,copa-auto,copa-auto-theta${FIRST_THETA}"
+            CCS="copa,copa-auto,copa-auto-nc,copa-auto-theta${FIRST_THETA}"
             QUEUES="150000"
           fi
           if [ "$MODE" = "rct" ]; then
@@ -468,7 +468,7 @@ jobs:
           AVAIL_CCS=" $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo 'cubic reno bbr') "
           CCS="copa_auto,copa_auto_nc,copa_auto_theta${FIRST_THETA},copa_orig,mortise_copa,bbr,cubic"
           if [ "$MODE" = "quick" ] || [ "$MODE" = "datasets" ]; then
-            CCS="copa_auto,copa_auto_theta${FIRST_THETA},copa_orig,mortise_copa"
+            CCS="copa_auto,copa_auto_nc,copa_auto_theta${FIRST_THETA},mortise_copa"
           elif [ "$MODE" = "rct" ]; then
             CCS="copa_auto,copa_auto_theta0.9,copa_auto_theta0.98,copa_orig,mortise_copa"
           elif [ "$MODE" = "rct-datasets" ]; then

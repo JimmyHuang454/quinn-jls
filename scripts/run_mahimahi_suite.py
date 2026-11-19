@@ -516,8 +516,10 @@ def run_mortise_job(
             'status=$?; if [ "$status" -eq 124 ] || [ "$status" -eq 130 ] || [ "$status" -eq 137 ] || [ "$status" -eq 143 ]; then exit 0; fi; exit "$status"'
         )
     else:
+        # Give slow delay-based baselines (e.g. copa_orig/vegas on high-jitter LTE) enough
+        # headroom to complete all requests; fast algorithms exit as soon as the last request finishes.
         client_cmd = (
-            f'timeout {app_secs + 20} "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
+            f'timeout -s INT -k 10 {app_secs + 300} "{bin_path}" --connect "${{MAHIMAHI_BASE}}" '
             f'--congestion "{kernel_cc}" --workload "{workload_path}" --output "{rct_path}"'
         )
     # For bulk runs, timeout exit codes (124/130/137/143) are expected when stopping at bulk_secs.
